@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Inspectomatic – AI-Powered Property Inspection Analysis</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Add jsPDF for PDF export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.9.3/html2pdf.bundle.min.js"></script>
+
+  <!-- Google Places Autocomplete -->
+  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAOD1Uy1jhgYHF0q44UekuM984sLF-lGbQ&libraries=places"></script>
+
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Inspectomatic</h1>
+      <p class="meta" style="margin-top: -8px; margin-bottom: 24px;">Transform inspection reports into organized, actionable repair lists</p>
+      
+      <ol class="steps">
+        <li class="step active" data-step="1"><span>1</span> Upload inspection report</li>
+        <li class="step" data-step="2"><span>2</span> Property address</li>
+        <li class="step" data-step="3"><span>3</span> Additional notes (optional)</li>
+        <li class="step" data-step="4"><span>4</span> Submit</li>
+      </ol>
+
+      <div class="panes">
+        <!-- Step 1: Upload -->
+        <section class="pane" id="pane-1">
+          <div id="dropzone" class="drop">
+            <div>
+              <div class="headline">Drag & drop your file here</div>
+              <div class="or">or</div>
+              <button id="browseBtn" class="btn">Choose file</button>
+              <div class="meta">Supported: <b>.pdf</b>, <b>.txt</b>, <b>.png</b>, <b>.jpg</b>, <b>.jpeg</b></div>
+            </div>
+          </div>
+          <input id="fileInput" type="file" accept=".pdf,.txt,.png,.jpg,.jpeg" class="hidden"/>
+          <div id="fileBadge" class="row meta" style="margin-top:12px;"></div>
+          <div class="row nav">
+            <button id="nextFrom1" class="btn" disabled>Next</button>
+          </div>
+        </section>
+
+        <!-- Step 2: Address + Autocomplete -->
+        <section class="pane hidden" id="pane-2">
+          <label class="label" for="address">Property address</label>
+          <div class="autocomplete">
+            <input id="address" type="text" class="input" placeholder="Start typing an address…" autocomplete="off"/>
+            <ul id="addrSuggestions" class="suggestions hidden"></ul>
+          </div>
+          <div class="meta">Address suggestions provided by OpenStreetMap</div>
+          <div class="row nav">
+            <button id="backTo1" class="btn secondary">Back</button>
+            <button id="nextFrom2" class="btn" disabled>Next</button>
+          </div>
+        </section>
+
+        <!-- Step 3: Notes -->
+        <section class="pane hidden" id="pane-3">
+          <label class="label" for="notes">Additional notes</label>
+          <textarea id="notes" class="textarea" rows="6" placeholder="Example: Focus on HVAC and roof issues; seller prefers weekend appointments."></textarea>
+          <div class="row nav">
+            <button id="backTo2" class="btn secondary">Back</button>
+            <button id="nextFrom3" class="btn">Next</button>
+          </div>
+        </section>
+
+        <!-- Step 4: Submit + Results -->
+        <section class="pane hidden" id="pane-4">
+          <div class="meta">
+            Our AI system will analyze your inspection report and organize it into actionable repair categories with contractor recommendations.
+          </div>
+          <div class="row nav">
+            <button id="backTo3" class="btn secondary">Back</button>
+            <button id="submitBtn" class="btn">Analyze Report</button>
+          </div>
+
+          <div class="divider"></div>
+          <div class="row" style="margin-bottom:8px;">
+            <div class="headline">Inspection Report Analysis</div>
+            <button id="downloadPdfBtn" class="btn" style="margin-left:auto;" disabled>Download PDF Report</button>
+          </div>
+
+          <div class="result">
+            <div id="reportDisplay" class="hidden">
+              <!-- Beautiful report will be rendered here -->
+            </div>
+            <div id="loadingDisplay" style="text-align: center; padding: 60px 20px; color: #6b7280;">
+              <div id="loadingText">Awaiting analysis...</div>
+              <div id="status" class="meta" style="margin-top: 8px;"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <script src="/static/script.js" defer></script>
+</body>
+</html>
