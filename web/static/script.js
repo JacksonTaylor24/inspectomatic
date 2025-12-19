@@ -1,4 +1,5 @@
-// static/script.js — pricing, clean reasons, and locations restored
+// static/script.js — pricing, clean reasons, locations, Google address autocomplete, providers, html2pdf
+// static/script.js — pricing, clean reasons, locations, Google address autocomplete, providers, html2pdf
 (function () {
   "use strict";
 
@@ -28,7 +29,7 @@
   ];
   const SEV_SCORE = { high: 3, medium: 2, low: 1 };
 
-  console.log("DEBUG: script.js is loading (clean reasons + locations)...");
+  console.log("DEBUG: script.js is loading (clean reasons + locations + Google autocomplete + providers)...");
 
   const steps = Array.from(document.querySelectorAll(".step"));
   const panes = {
@@ -48,7 +49,6 @@
   // Step 2 (Address)
   const backTo1 = document.getElementById("backTo1");
   const addressInput = document.getElementById("address");
-  const addrSuggestions = document.getElementById("addrSuggestions");
   const nextFrom2 = document.getElementById("nextFrom2");
 
   // Step 3 (Notes)
@@ -126,72 +126,10 @@
   nextFrom3?.addEventListener("click", () => go(4));
   backTo3?.addEventListener("click", () => go(3));
 
-  // --- Address autocomplete (Nominatim for dev) ---
-  let acTimer = null;
+  // Step 2: enable/disable "Next" based on address text
   addressInput?.addEventListener("input", () => {
     const q = addressInput.value.trim();
     nextFrom2.disabled = q.length < 3;
-
-    if (acTimer) clearTimeout(acTimer);
-    if (q.length < 3) {
-      hideSuggestions();
-      return;
-    }
-
-    acTimer = setTimeout(async () => {
-      try {
-        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=5&countrycodes=us&q=${encodeURIComponent(
-          q
-        )}`;
-        const res = await fetch(url, {
-          headers: { Accept: "application/json" }
-        });
-        const data = await res.json();
-        renderSuggestions(Array.isArray(data) ? data : []);
-      } catch {
-        hideSuggestions();
-      }
-    }, 300);
-  });
-
-  function renderSuggestions(arr) {
-    if (!arr.length) {
-      hideSuggestions();
-      return;
-    }
-    addrSuggestions.innerHTML = arr
-      .map((item) => {
-        const label = item.display_name || "";
-        return `<li data-label="${escapeHtml(
-          label
-        )}">${escapeHtml(label)}</li>`;
-      })
-      .join("");
-    addrSuggestions.classList.remove("hidden");
-  }
-
-  function hideSuggestions() {
-    addrSuggestions.innerHTML = "";
-    addrSuggestions.classList.add("hidden");
-  }
-
-  addrSuggestions?.addEventListener("click", (e) => {
-    const li = e.target.closest("li");
-    if (!li) return;
-    const label = li.getAttribute("data-label");
-    addressInput.value = label || addressInput.value;
-    nextFrom2.disabled = addressInput.value.trim().length < 3;
-    hideSuggestions();
-  });
-
-  document.addEventListener("click", (e) => {
-    if (
-      addrSuggestions &&
-      !addrSuggestions.contains(e.target) &&
-      e.target !== addressInput
-    ) {
-      hideSuggestions();
-    }
   });
 
   function escapeHtml(s) {
@@ -209,19 +147,13 @@
     if (!text) return "";
     let t = String(text);
 
-    // Cut off anything after a pipe (we used "Reason: ... | Estimated cost range: ...")
     const pipeIdx = t.indexOf("|");
     if (pipeIdx !== -1) {
       t = t.slice(0, pipeIdx);
     }
 
-    // Remove explicit "Estimated cost range: ..." fragments if any remain
     t = t.replace(/Estimated cost range:.*$/i, "");
-
-    // Remove leading "Reason:" or "Reason -" labels
     t = t.replace(/^\s*Reason[:\-]\s*/i, "");
-
-    // Collapse whitespace
     t = t.replace(/\s+/g, " ").trim();
 
     return t;
@@ -235,6 +167,7 @@
     console.log("DEBUG: Submit button clicked");
 
     if (!selectedFile) {
+      console.warn("DEBUG: No file selected, returning to step 1");
       go(1);
       return;
     }
@@ -248,6 +181,7 @@
     lastNotes = (notesEl?.value || "").trim();
     lastAddress = (addressInput?.value || "").trim();
 
+    console.log("DEBUG: Submitting with address =", lastAddress);
     const form = new FormData();
     form.append("file", selectedFile);
     form.append("address", lastAddress);
@@ -258,14 +192,17 @@
       const res = await fetch("/upload", { method: "POST", body: form });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
+        console.error("DEBUG: /upload returned non-OK", res.status, err);
         throw new Error(err.detail || "Upload failed");
       }
 
       const data = await res.json();
       lastResult = data;
 
-      console.log("=== FULL API RESPONSE ===");
-      console.log(JSON.stringify(data, null, 2));
+      console.log("=== DEBUG: FULL API RESPONSE (truncated) ===");
+      console.log(JSON.stringify(data, null, 2).slice(0, 4000));
+      console.log("=== DEBUG: meta.providers from backend ===");
+      console.log(data?.meta?.providers);
 
       statusEl.textContent = "Generating beautiful report...";
 
@@ -291,10 +228,13 @@
     const normalized = Array.isArray(data?.normalized_items)
       ? data.normalized_items
       : null;
+    const providersByCategory = data?.meta?.providers || {};
 
-    // IMPORTANT: prefer items array (has cost_low / cost_high), but pull location/explanation from normalized when available
+    console.log("DEBUG: providersByCategory in buildAndDisplayReport:", providersByCategory);
+
+    // Prefer items array (has cost_low / cost_high), but pull location/explanation from normalized when available
     if (Array.isArray(data?.items) && data.items.length > 0) {
-      console.log("Using items array (with normalized_items for locations)");
+      console.log("DEBUG: Using items array (with normalized_items for locations). Length:", data.items.length);
       items = data.items.map((it, idx) => {
         const norm = normalized && normalized[idx] ? normalized[idx] : null;
         return {
@@ -319,7 +259,7 @@
       Array.isArray(data?.normalized_items) &&
       data.normalized_items.length > 0
     ) {
-      console.log("Using normalized_items array only");
+      console.log("DEBUG: Using normalized_items array only. Length:", data.normalized_items.length);
       items = data.normalized_items.map((it) => ({
         category: it.category || "Minor Handyman Repairs",
         item: (it.item || "").trim(),
@@ -345,6 +285,7 @@
     }
 
     if (!items.length) {
+      console.warn("DEBUG: No items found to display in report");
       reportDisplay.innerHTML =
         '<div style="text-align: center; padding: 40px; color: #6b7280;">No repair items found in the document.</div>';
       loadingDisplay.style.display = "none";
@@ -374,12 +315,15 @@
       byCat.get(it.category).push(it);
     });
 
+    console.log("DEBUG: Categories in report:", Array.from(byCat.keys()));
+
     const reportHtml = buildReportHTML(
       byCat,
       address,
       notes,
       items.length,
-      pricingTotals
+      pricingTotals,
+      providersByCategory
     );
 
     reportDisplay.innerHTML = reportHtml;
@@ -387,7 +331,7 @@
     reportDisplay.classList.remove("hidden");
   }
 
-  function buildReportHTML(byCat, address, notes, totalItems, pricingTotals) {
+  function buildReportHTML(byCat, address, notes, totalItems, pricingTotals, providersByCategory) {
     const currentDate = new Date().toLocaleDateString("en-US", {
       year: "numeric",
       month: "long",
@@ -399,7 +343,6 @@
       minute: "2-digit"
     });
 
-    // Top-level total pricing pill
     const totalRangeHtml =
       pricingTotals &&
       typeof pricingTotals.low === "number" &&
@@ -457,9 +400,11 @@
       `;
     }
 
-    // Category sections
     byCat.forEach((arr, category) => {
       if (!arr || !arr.length) return;
+
+      const providers = providersByCategory[category] || [];
+      console.log(`DEBUG: Providers for category "${category}":`, providers);
 
       html += `
         <div class="report-section" style="margin-bottom: 40px;">
@@ -471,8 +416,10 @@
 
       arr.forEach((item, index) => {
         const severityText =
-          item.severity.charAt(0).toUpperCase() +
-          item.severity.slice(1);
+          item.severity && item.severity.length
+            ? item.severity.charAt(0).toUpperCase() +
+              item.severity.slice(1)
+            : "Medium";
         const hasPrice =
           typeof item.price_low === "number" &&
           typeof item.price_high === "number";
@@ -481,8 +428,7 @@
           <div style="padding: 20px; border-bottom: 1px solid #f1f3f4;">
             <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px;">
               <div style="width: 24px; height: 24px; border: 1px solid #000; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-                <span style="font-size: 12px; font-weight: 600;">${index +
-                  1}</span>
+                <span style="font-size: 12px; font-weight: 600;">${index + 1}</span>
               </div>
               <div style="flex: 1;">
                 <h4 style="margin: 0 0 8px 0; font-size: 15px; font-weight: 600; color: #000;">${escapeHtml(
@@ -543,13 +489,46 @@
         `;
       });
 
+      // Providers section
       html += `
             <div style="padding: 20px; background: #f8f9fa; border-top: 1px solid #e9ecef;">
               <h4 style="margin: 0 0 12px 0; font-size: 12px; font-weight: 600; color: #000; text-transform: uppercase; letter-spacing: 0.5px;">RECOMMENDED PROVIDERS</h4>
               <div style="display: flex; flex-direction: column; gap: 8px;">
-                <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">1) Company: ___________________   Phone: ___________________   Rating: ___________________</div>
-                <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">2) Company: ___________________   Phone: ___________________   Rating: ___________________</div>
-                <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">3) Company: ___________________   Phone: ___________________   Rating: ___________________</div>
+      `;
+
+      if (providers.length) {
+        providers.slice(0, 3).forEach((p, idx) => {
+          html += `
+            <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #111827;">
+              <strong>${idx + 1}) ${escapeHtml(p.name || "Unknown")}</strong><br>
+              ${p.phone ? `📞 ${escapeHtml(p.phone)} ` : ""}
+              ${
+                p.rating
+                  ? `• ⭐ ${Number(p.rating).toFixed(1)} (${p.review_count || 0} reviews)`
+                  : ""
+              }
+              ${
+                p.address
+                  ? `<br><span style="color:#6b7280;">📍 ${escapeHtml(p.address)}</span>`
+                  : ""
+              }
+            </div>
+          `;
+        });
+      } else {
+        console.warn(`DEBUG: No providers returned for category "${category}" - showing blanks.`);
+      }
+
+      // Fill remaining slots if fewer than 3
+      for (let i = providers.length + 1; i <= 3; i++) {
+        html += `
+          <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">
+            ${i}) Company: ___________________   Phone: ___________________   Rating: ___________________
+          </div>
+        `;
+      }
+
+      html += `
               </div>
             </div>
           </div>
@@ -599,23 +578,64 @@
     }
   }
 
-  // ---------- PDF Export ----------
+  // ---------- PDF Export via html2pdf ----------
   async function exportToPDF() {
     const element = document.getElementById("reportDisplay");
-  
-    const opt = {
-      margin:       0.5,
-      filename:     slug(lastAddress || "inspection-report") + ".pdf",
-      image:        { type: 'jpeg', quality: 0.98 },
-      html2canvas:  { scale: 2, useCORS: true },
-      jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
-    };
-  
-    html2pdf().from(element).set(opt).save();
-  }
-  
+    if (!element) {
+      alert("No report to export");
+      return;
+    }
 
-  // ---------- Helper Functions ----------
+    downloadPdfBtn.disabled = true;
+    downloadPdfBtn.textContent = "Generating PDF...";
+
+    try {
+      const opt = {
+        margin: 0.5,
+        filename: slug(lastAddress || "inspection-report") + ".pdf",
+        image: { type: "jpeg", quality: 0.98 },
+        html2canvas: { scale: 2, useCORS: true },
+        jsPDF: { unit: "in", format: "letter", orientation: "portrait" }
+      };
+
+      await html2pdf().from(element).set(opt).save();
+    } catch (err) {
+      console.error("PDF generation failed:", err);
+      alert("Failed to generate PDF. Please try again.");
+    } finally {
+      downloadPdfBtn.disabled = false;
+      downloadPdfBtn.textContent = "Download PDF Report";
+    }
+  }
+
+  // ---------- Google Places Autocomplete ----------
+  function initGoogleAutocomplete() {
+    if (!addressInput) {
+      console.warn("DEBUG: No address input found for autocomplete");
+      return;
+    }
+    if (!window.google || !google.maps || !google.maps.places) {
+      console.warn("Google Places library not available");
+      return;
+    }
+
+    console.log("DEBUG: Initializing Google Autocomplete");
+    const autocomplete = new google.maps.places.Autocomplete(addressInput, {
+      fields: ["formatted_address", "geometry"],
+      componentRestrictions: { country: "us" }
+    });
+
+    autocomplete.addListener("place_changed", () => {
+      const place = autocomplete.getPlace();
+      if (!place || !place.formatted_address) return;
+
+      addressInput.value = place.formatted_address;
+      const q = addressInput.value.trim();
+      nextFrom2.disabled = q.length < 3;
+      console.log("DEBUG: Autocomplete selected address:", addressInput.value);
+    });
+  }
+
   function getSpecialistLabel(category) {
     const specialistMap = {
       Plumbing: "plumber",
@@ -659,6 +679,9 @@
     );
   }
 
-  console.log("DEBUG: Starting wizard...");
-  go(1);
+  document.addEventListener("DOMContentLoaded", () => {
+    console.log("DEBUG: DOMContentLoaded – starting wizard + Google autocomplete + providers...");
+    go(1);
+    initGoogleAutocomplete();
+  });
 })();

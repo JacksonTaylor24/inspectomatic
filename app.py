@@ -14,13 +14,14 @@ import pytesseract
 import io, re, os, json
 from pathlib import Path
 
-import requests  # add with other imports near the top
+import requests  # HTTP client for Google APIs
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-
+print("DEBUG[config]: GOOGLE_MAPS_API_KEY present:", bool(GOOGLE_MAPS_API_KEY))
 
 # ---------------- AI client setup ----------------
 AI_PROVIDER = os.getenv("AI_PROVIDER", "claude")  # "claude" or "openai"
+print("DEBUG[config]: AI_PROVIDER =", AI_PROVIDER)
 
 # Claude setup
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
@@ -46,6 +47,10 @@ else:
     MAX_TOKENS = OPENAI_MAX_TOKENS
     RESPONSE_MAX_TOKENS = OPENAI_RESPONSE_MAX_TOKENS
 
+print("DEBUG[config]: MODEL_NAME =", MODEL_NAME)
+print("DEBUG[config]: API_KEY present:", bool(API_KEY))
+print("DEBUG[config]: MAX_TOKENS =", MAX_TOKENS, "RESPONSE_MAX_TOKENS =", RESPONSE_MAX_TOKENS)
+
 # Initialize clients
 _anthropic_client = None
 _openai_client = None
@@ -53,13 +58,17 @@ _openai_client = None
 try:
     import anthropic
     _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-except Exception:
+    print("DEBUG[config]: Anthropic client initialized:", bool(_anthropic_client))
+except Exception as e:
+    print("DEBUG[config]: Error initializing Anthropic client:", e)
     _anthropic_client = None
 
 try:
     from openai import OpenAI
     _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception:
+    print("DEBUG[config]: OpenAI client initialized:", bool(_openai_client))
+except Exception as e:
+    print("DEBUG[config]: Error initializing OpenAI client:", e)
     _openai_client = None
 
 # ---------------- App setup ----------------
@@ -219,6 +228,7 @@ class ParsedResponse(BaseModel):
 # ---------------- Text extraction ----------------
 def extract_pages_text_from_pdf(file_bytes: bytes) -> str:
     """Extract text from PDF, prefer native text; OCR as fallback."""
+    print("DEBUG[extract_pages_text_from_pdf]: starting")
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         pages_text = []
@@ -226,23 +236,32 @@ def extract_pages_text_from_pdf(file_bytes: bytes) -> str:
             text = page.extract_text() or ""
             pages_text.append(text.strip())
         combined = "\n\n".join(pages_text).strip()
+        print("DEBUG[extract_pages_text_from_pdf]: extracted chars:", len(combined))
         if len(combined) > 100:
             return combined
-    except Exception:
-        pass
+    except Exception as e:
+        print("DEBUG[extract_pages_text_from_pdf]: error with native text:", e)
 
     try:
+        print("DEBUG[extract_pages_text_from_pdf]: falling back to OCR")
         images = convert_from_bytes(file_bytes, fmt="png", dpi=300)
         ocr_text = [pytesseract.image_to_string(img) for img in images]
-        return "\n\n".join(ocr_text).strip()
+        combined = "\n\n".join(ocr_text).strip()
+        print("DEBUG[extract_pages_text_from_pdf]: OCR extracted chars:", len(combined))
+        return combined
     except Exception as e:
+        print("DEBUG[extract_pages_text_from_pdf]: OCR failure:", e)
         raise HTTPException(status_code=400, detail=f"Could not extract text from PDF: {e}")
 
 def extract_text_from_image(file_bytes: bytes) -> str:
+    print("DEBUG[extract_text_from_image]: starting")
     try:
         image = Image.open(io.BytesIO(file_bytes))
-        return pytesseract.image_to_string(image)
+        text = pytesseract.image_to_string(image)
+        print("DEBUG[extract_text_from_image]: extracted chars:", len(text))
+        return text
     except Exception as e:
+        print("DEBUG[extract_text_from_image]: failure:", e)
         raise HTTPException(status_code=400, detail=f"Image OCR failed: {e}")
 
 # ---------------- Enhanced System Prompt ----------------
@@ -293,6 +312,16 @@ When borderline between categories, prefer the earlier one in this frequency lis
 UNIQUENESS & SPLITTING:
 - From any single source line, output **either** ONE handyman item (if a competent handyman can reasonably do the work) **or** multiple trade-specific items — **never both**.
 - Do **not** duplicate the same action across multiple categories.
+
+GROUPING RULE (SAME-LINE ONLY):
+- If ONE inspection line describes the SAME repair action in multiple locations
+  (e.g., “seal 3 gaps…”, “recaulk guest & master showers”, “repair siding in two areas”),
+  output ONE grouped item.
+- Use qty = number of locations/gaps/areas, units = "gaps"/"areas"/etc., and location =
+  a short summary naming all locations.
+- Do NOT group items from different lines or different actions. Multiple items per trade
+  are expected when tasks are distinct.
+- Only group same-action, same-line repetitions — everything else stays separate.
 
 HANDYMAN CONSOLIDATION PRIORITY:
 - **MINIMIZE TOTAL CONTRACTORS** - When in doubt between a specialist and handyman, choose **"Minor Handyman Repairs"** to reduce the number of professionals needed
@@ -414,7 +443,6 @@ Output JSON ONLY in this format:
 }
 """
 
-
 def chunk_text_by_tokens(text: str, max_tokens: int) -> List[str]:
     max_chars = max_tokens * 4
     if len(text) <= max_chars:
@@ -455,6 +483,7 @@ def _coerce_json(text: str):
 
 # ---------------- AI extraction/pricing wrappers ----------------
 def call_ai_extraction(text: str, address: str = "") -> dict:
+    print("DEBUG[call_ai_extraction]: provider =", AI_PROVIDER, "chars=", len(text))
     if AI_PROVIDER.lower() == "claude":
         return call_claude_extraction(text, address)
     else:
@@ -462,6 +491,7 @@ def call_ai_extraction(text: str, address: str = "") -> dict:
 
 def call_claude_extraction(text: str, address: str = "") -> dict:
     if not ANTHROPIC_API_KEY or not _anthropic_client:
+        print("DEBUG[call_claude_extraction]: Anthropic not configured")
         return {"items": [], "ignored_examples": [], "error": "Anthropic API not configured"}
 
     try:
@@ -493,10 +523,12 @@ Document Content:
             parsed = {"items": parsed, "ignored_examples": []}
         return parsed if isinstance(parsed, dict) else {"items": [], "ignored_examples": []}
     except Exception as e:
+        print("DEBUG[call_claude_extraction]: exception:", e)
         return {"items": [], "ignored_examples": [], "error": str(e)}
 
 def call_openai_extraction(text: str, address: str = "") -> dict:
     if not OPENAI_API_KEY or not _openai_client:
+        print("DEBUG[call_openai_extraction]: OpenAI not configured")
         return {"items": [], "ignored_examples": [], "error": "OpenAI API not configured"}
 
     messages = [
@@ -520,18 +552,23 @@ Document Content:
             top_p=0.1,
             frequency_penalty=0.0,
             presence_penalty=0.0,
-            max_tokens=OPENAI_RESPONSE_MAX_TOKENS,
+            max_tokens=RESPONSE_MAX_TOKENS,
         )
         result_text = resp.choices[0].message.content
+        print("\n=== DEBUG: Raw OpenAI Extraction (first 500 chars) ===")
+        print(result_text[:500])
+        print("=" * 50)
         parsed = _coerce_json(result_text)
         if isinstance(parsed, list):
             parsed = {"items": parsed, "ignored_examples": []}
         return parsed if isinstance(parsed, dict) else {"items": [], "ignored_examples": []}
     except Exception as e:
+        print("DEBUG[call_openai_extraction]: exception:", e)
         return {"items": [], "ignored_examples": [], "error": str(e)}
 
 def call_claude_pricing(items: List[NormalizedLineItem], address: str = "") -> Dict[int, PriceEstimate]:
     if not ANTHROPIC_API_KEY or not _anthropic_client:
+        print("DEBUG[call_claude_pricing]: Anthropic not configured")
         return {}
 
     payload = []
@@ -587,15 +624,184 @@ Here are the repair items to price (array of objects):
                 out[idx] = pe
             except Exception:
                 continue
+        print("DEBUG[call_claude_pricing]: built pricing map for", len(out), "items")
         return out
     except Exception as e:
-        print(f"Pricing error: {e}")
+        print("DEBUG[call_claude_pricing]: exception:", e)
         return {}
 
 def call_ai_pricing(items: List[NormalizedLineItem], address: str = "") -> Dict[int, PriceEstimate]:
+    print("DEBUG[call_ai_pricing]: provider =", AI_PROVIDER, "items=", len(items))
     if AI_PROVIDER.lower() == "claude":
         return call_claude_pricing(items, address)
     return {}
+
+# ---------- Provider scoring & Google Places helpers ----------
+def provider_score(rating: float, reviews: int, prior_mean: float = 4.3, prior_weight: int = 20) -> float:
+    """
+    Bayesian-style score so that:
+    - 50 reviews @ 4.8 beats 2 reviews @ 5.0
+    - score → rating as reviews grow
+    """
+    if rating <= 0 or reviews < 0:
+        return 0.0
+    return (rating * reviews + prior_mean * prior_weight) / (reviews + prior_weight)
+
+def geocode_address(address: str):
+    """Geocode an address to (lat, lng) using Google Geocoding API."""
+    print("DEBUG[geocode_address]: called with address:", repr(address))
+    if not GOOGLE_MAPS_API_KEY:
+        print("DEBUG[geocode_address]: GOOGLE_MAPS_API_KEY is missing/empty")
+        return None
+    if not address:
+        print("DEBUG[geocode_address]: address is empty/falsey")
+        return None
+
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+            timeout=5,
+        )
+        data = resp.json()
+        status = data.get("status")
+        print("DEBUG[geocode_address]: status =", status)
+        if status != "OK":
+            print("DEBUG[geocode_address]: error_message =", data.get("error_message"))
+            return None
+        loc = data["results"][0]["geometry"]["location"]
+        coords = (loc["lat"], loc["lng"])
+        print("DEBUG[geocode_address]: coords =", coords)
+        return coords
+    except Exception as e:
+        print("DEBUG[geocode_address]: exception:", e)
+        return None
+
+def _places_nearby(lat: float, lng: float, keyword: str, radius_m: int) -> list:
+    print(f"DEBUG[_places_nearby]: lat={lat}, lng={lng}, keyword={keyword!r}, radius_m={radius_m}")
+    if not GOOGLE_MAPS_API_KEY:
+        print("DEBUG[_places_nearby]: GOOGLE_MAPS_API_KEY is missing/empty")
+        return []
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params={
+                "key": GOOGLE_MAPS_API_KEY,
+                "location": f"{lat},{lng}",
+                "radius": radius_m,
+                "keyword": keyword,
+            },
+            timeout=5,
+        )
+        data = resp.json()
+        status = data.get("status")
+        print("DEBUG[_places_nearby]: status =", status)
+        if status not in ("OK", "ZERO_RESULTS"):
+            print("DEBUG[_places_nearby]: error_message =", data.get("error_message"))
+        results = data.get("results", [])
+        print(f"DEBUG[_places_nearby]: got {len(results)} raw results")
+        return results
+    except Exception as e:
+        print("DEBUG[_places_nearby]: exception:", e)
+        return []
+
+def _place_details(place_id: str) -> dict:
+    print("DEBUG[_place_details]: called with place_id:", place_id)
+    if not GOOGLE_MAPS_API_KEY:
+        print("DEBUG[_place_details]: GOOGLE_MAPS_API_KEY is missing/empty")
+        return {}
+    if not place_id:
+        print("DEBUG[_place_details]: empty place_id")
+        return {}
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={
+                "key": GOOGLE_MAPS_API_KEY,
+                "place_id": place_id,
+                "fields": "formatted_phone_number,website,formatted_address"
+            },
+            timeout=5,
+        )
+        data = resp.json()
+        status = data.get("status")
+        print("DEBUG[_place_details]: status =", status)
+        if status not in ("OK", "ZERO_RESULTS"):
+            print("DEBUG[_place_details]: error_message =", data.get("error_message"))
+        result = data.get("result", {}) or {}
+        print(
+            "DEBUG[_place_details]: has phone:", bool(result.get("formatted_phone_number")),
+            "address:", bool(result.get("formatted_address"))
+        )
+        return result
+    except Exception as e:
+        print("DEBUG[_place_details]: exception:", e)
+        return {}
+
+def find_providers_for_category(category: str, lat: float, lng: float) -> list:
+    """
+    Expand radius until we have enough candidates, then score and pick top 3.
+    - radii: 10, 20, 40 miles
+    - require rating >= 4.0 and reviews >= 5
+    - use Bayesian provider_score(rating, reviews)
+    """
+    labels = CATEGORY_PROVIDER_MAP.get(category, {}).get("providers") or [category]
+    keyword = " ".join(labels)
+    print(f"DEBUG[find_providers_for_category]: category={category!r}, keyword={keyword!r}, coords=({lat},{lng})")
+
+    radii_miles = [10, 20, 40]
+    radii = [int(r * 1609.34) for r in radii_miles]
+
+    seen = set()
+    candidates = []
+
+    for r_m, r_miles in zip(radii, radii_miles):
+        print(f"DEBUG[find_providers_for_category]: searching radius {r_miles}mi ({r_m}m)")
+        results = _places_nearby(lat, lng, keyword, r_m)
+        print(f"DEBUG[find_providers_for_category]: radius {r_miles}mi returned {len(results)} results")
+
+        for r in results:
+            pid = r.get("place_id")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+
+            rating = float(r.get("rating", 0.0))
+            reviews = int(r.get("user_ratings_total", 0))
+
+            if rating < 4.0 or reviews < 5:
+                print(f"DEBUG[find_providers_for_category]: skipping {r.get('name')} rating={rating} reviews={reviews}")
+                continue
+
+            score = provider_score(rating, reviews)
+            candidates.append({
+                "place_id": pid,
+                "name": r.get("name"),
+                "rating": rating,
+                "review_count": reviews,
+                "address": r.get("vicinity"),
+                "score": score,
+            })
+
+        print(f"DEBUG[find_providers_for_category]: cumulative candidates={len(candidates)} after {r_miles}mi")
+        if len(candidates) >= 15:
+            break
+
+    candidates.sort(key=lambda x: (x["score"], x["review_count"]), reverse=True)
+    top = candidates[:3]
+    print(f"DEBUG[find_providers_for_category]: top {len(top)} candidates selected")
+
+    enriched = []
+    for p in top:
+        details = _place_details(p["place_id"])
+        if details:
+            p["phone"] = details.get("formatted_phone_number")
+            p["website"] = details.get("website")
+            p["address"] = details.get("formatted_address") or p["address"]
+        enriched.append(p)
+
+    print("DEBUG[find_providers_for_category]: enriched providers:", enriched)
+    return enriched
 
 # ---------- Heuristic capture ----------
 NUMBERED_OR_BULLET = re.compile(r'^\s*(?:\d+\s*[\.)-]\s*|[-*•]\s+)?(.+)$', re.MULTILINE)
@@ -615,6 +821,7 @@ SUMMARY_PATTERN = re.compile(
 )
 
 def simple_fallback_parse(text: str) -> List[LineItem]:
+    print("DEBUG[simple_fallback_parse]: running fallback parser")
     items: List[LineItem] = []
     for m in NUMBERED_OR_BULLET.finditer(text):
         line = (m.group(1) or "").strip()
@@ -628,6 +835,7 @@ def simple_fallback_parse(text: str) -> List[LineItem]:
             continue
         if REPAIR_HINT.search(line):
             items.append(LineItem(category="Minor Handyman Repairs", item_text=line))
+    print("DEBUG[simple_fallback_parse]: found", len(items), "items")
     return items
 
 # ---- Dedupe & arbitration ----
@@ -641,7 +849,7 @@ def _canon(s: str) -> str:
         t = s.lower()
         t = re.sub(r"[^a-z0-9\s]", " ", t)
         t = re.sub(r"\b(please|ensure|properly|all|the|a|an|that|to|be|is|are|needs|need|should|with|of|for|on|in|at|and)\b", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
+        t = re.sub(r"\s+", " ", t).trim()
         return t
     except Exception:
         return str(s).encode('ascii', 'ignore').decode('ascii').lower().strip()
@@ -716,6 +924,7 @@ def _similar_actions(a: NormalizedLineItem, b: NormalizedLineItem) -> bool:
     return False
 
 def dedupe_and_arbitrate(items: List[NormalizedLineItem]) -> List[NormalizedLineItem]:
+    print("DEBUG[dedupe_and_arbitrate]: starting with", len(items), "items")
     try:
         fixed = [_post_categorization_fixups(it) for it in items]
     except Exception as e:
@@ -846,10 +1055,12 @@ def dedupe_and_arbitrate(items: List[NormalizedLineItem]) -> List[NormalizedLine
                 result.append(fixed[g[0]])
             continue
 
+    print("DEBUG[dedupe_and_arbitrate]: finished with", len(result), "items")
     return result
 
 # ---------- Merge heuristics ----------
 def _merge_with_heuristics(full_text: str, normalized: List[NormalizedLineItem]) -> Tuple[List[NormalizedLineItem], int]:
+    print("DEBUG[_merge_with_heuristics]: starting with", len(normalized), "normalized items")
     heur_items = []
     for m in NUMBERED_OR_BULLET.finditer(full_text):
         line = (m.group(1) or "").strip()
@@ -874,10 +1085,13 @@ def _merge_with_heuristics(full_text: str, normalized: List[NormalizedLineItem])
         if not dup:
             normalized.append(h)
             added += 1
+
+    print("DEBUG[_merge_with_heuristics]: added", added, "heuristic items; total now", len(normalized))
     return normalized, added
 
 # ---------------- Explanations backstop ----------------
 def ensure_explanations(items: List[NormalizedLineItem]) -> List[NormalizedLineItem]:
+    print("DEBUG[ensure_explanations]: ensuring explanations for", len(items), "items")
     for it in items:
         if not it.explanation or not str(it.explanation).strip():
             it.explanation = DEFAULT_EXPLANATION_BY_CATEGORY.get(
@@ -888,10 +1102,12 @@ def ensure_explanations(items: List[NormalizedLineItem]) -> List[NormalizedLineI
 
 # ---------------- Core extraction flow ----------------
 def extract_repairs_comprehensive(text: str, address: str = "") -> Tuple[List[NormalizedLineItem], List[IgnoredExample], Dict]:
+    print("DEBUG[extract_repairs_comprehensive]: starting, chars=", len(text))
     estimated_tokens = len(text) // 4
     system_tokens = len(SYSTEM_PROMPT) // 4 + 200
 
     def _normalize_from_result(result_obj: dict) -> Tuple[List[NormalizedLineItem], List[IgnoredExample]]:
+        print("DEBUG[_normalize_from_result]: raw keys:", list(result_obj.keys()))
         items: List[NormalizedLineItem] = []
         ignored: List[IgnoredExample] = []
         its = result_obj.get("items", [])
@@ -916,10 +1132,12 @@ def extract_repairs_comprehensive(text: str, address: str = "") -> Tuple[List[No
                 v = (g.get("verbatim") or "").strip() if isinstance(g, dict) else ""
                 if v:
                     ignored.append(IgnoredExample(verbatim=v, why=g.get("why")))
+        print("DEBUG[_normalize_from_result]: normalized items:", len(items), "ignored:", len(ignored))
         return items, ignored
 
     # Single-shot path
     if estimated_tokens + system_tokens <= MAX_TOKENS - RESPONSE_MAX_TOKENS:
+        print("DEBUG[extract_repairs_comprehensive]: using single_request path")
         result = call_ai_extraction(text, address)
         norm_items, ignored = _normalize_from_result(result)
         norm_items = dedupe_and_arbitrate(norm_items)
@@ -937,14 +1155,17 @@ def extract_repairs_comprehensive(text: str, address: str = "") -> Tuple[List[No
             "model": MODEL_NAME,
             "ai_provider": AI_PROVIDER,
         }
+        print("DEBUG[extract_repairs_comprehensive]: single_request meta:", meta)
         return merged_items, ignored, meta
 
     # Chunked path
+    print("DEBUG[extract_repairs_comprehensive]: using multi_chunk path")
     chunks = chunk_text_by_tokens(text, MAX_TOKENS - system_tokens - RESPONSE_MAX_TOKENS)
     all_norm: List[NormalizedLineItem] = []
     all_ignored: List[IgnoredExample] = []
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        print(f"DEBUG[extract_repairs_comprehensive]: chunk {i+1}/{len(chunks)}, chars={len(chunk)}")
         result = call_ai_extraction(chunk, address)
         n, ig = _normalize_from_result(result)
         all_norm.extend(n)
@@ -965,6 +1186,7 @@ def extract_repairs_comprehensive(text: str, address: str = "") -> Tuple[List[No
         "model": MODEL_NAME,
         "ai_provider": AI_PROVIDER,
     }
+    print("DEBUG[extract_repairs_comprehensive]: multi_chunk meta:", meta)
     return merged_items, all_ignored, meta
 
 # ---------------- Routes ----------------
@@ -978,20 +1200,33 @@ async def upload(
     address: str = Form(default=""),
     notes: str = Form(default="")
 ):
+    print("\n=== DEBUG[/upload]: new request ===")
+    print("DEBUG[/upload]: incoming filename:", file.filename)
+    print("DEBUG[/upload]: address (form):", repr(address))
+    print("DEBUG[/upload]: notes length:", len(notes or ""))
+
     data = await file.read()
     name = (file.filename or "").lower()
 
+    # --- Text extraction ---
     if name.endswith(".pdf"):
+        print("DEBUG[/upload]: detected PDF")
         text = extract_pages_text_from_pdf(data)
     elif name.endswith(".txt"):
+        print("DEBUG[/upload]: detected TXT")
         text = data.decode("utf-8", errors="ignore")
     elif name.endswith((".png", ".jpg", ".jpeg")):
+        print("DEBUG[/upload]: detected image")
         text = extract_text_from_image(data)
     else:
+        print("DEBUG[/upload]: unsupported file type:", name)
         raise HTTPException(status_code=400, detail="Supported: .pdf, .txt, .png, .jpg, .jpeg")
 
     if not text or len(text.strip()) < 20:
+        print("DEBUG[/upload]: extracted text too short, len=", len(text or ""))
         raise HTTPException(status_code=422, detail="No meaningful text could be extracted from the file.")
+
+    print("DEBUG[/upload]: extracted text length:", len(text))
 
     normalized_items: List[NormalizedLineItem] = []
     ignored_examples: List[IgnoredExample] = []
@@ -1007,9 +1242,10 @@ async def upload(
 
     # Extraction
     if API_KEY and ((AI_PROVIDER.lower() == "claude" and _anthropic_client) or (AI_PROVIDER.lower() == "openai" and _openai_client)):
+        print("DEBUG[/upload]: API_KEY present and client initialized; running comprehensive extraction")
         try:
             normalized_items, ignored_examples, extraction_meta = extract_repairs_comprehensive(text, address)
-            print("\n=== DEBUG: First 3 extracted items ===")
+            print("\n=== DEBUG[/upload]: First 3 extracted items ===")
             for i, item in enumerate(normalized_items[:3]):
                 print(f"{i+1}. Item: {item.item}")
                 print(f"   Category: {item.category}")
@@ -1021,10 +1257,14 @@ async def upload(
                 **extraction_meta,
             })
         except Exception as e:
+            print("DEBUG[/upload]: extraction error:", e)
             meta["llm_error"] = str(e)
             meta["extraction_method"] = f"{AI_PROVIDER.lower()}_failed"
+    else:
+        print("DEBUG[/upload]: LLM not configured; skipping comprehensive extraction")
 
     if not normalized_items:
+        print("DEBUG[/upload]: no normalized_items from LLM, falling back to regex parser")
         fallback = simple_fallback_parse(text)
         normalized_items = [
             NormalizedLineItem(category=i.category, item=i.item_text, verbatim=i.item_text)
@@ -1033,26 +1273,28 @@ async def upload(
         normalized_items = ensure_explanations(normalized_items)
         meta["extraction_method"] = "fallback_regex"
 
+    print("DEBUG[/upload]: normalized_items count after extraction/fallback:", len(normalized_items))
+
     # --- Pricing step (Claude-only for now) ---
     pricing_totals = {"low": 0.0, "high": 0.0, "currency": "USD"}
     meta["pricing_used"] = False
 
     if normalized_items and AI_PROVIDER.lower() == "claude" and _anthropic_client:
+        print("DEBUG[/upload]: running pricing for items")
         try:
             pricing_map = call_ai_pricing(normalized_items, address)
-            print(f"=== DEBUG: Pricing map size: {len(pricing_map)} ===")
+            print(f"=== DEBUG[/upload]: Pricing map size: {len(pricing_map)} ===")
 
             # Attach prices
             for idx, it in enumerate(normalized_items):
                 if idx in pricing_map:
                     it.price = pricing_map[idx]
 
-            # NEW: drop all items the pricing agent says are $0–$0
+            # Drop all items the pricing agent says are $0–$0
             filtered_items = []
             for it in normalized_items:
                 if it.price and it.price.low == 0 and it.price.high == 0:
-                    # treat as non-actionable / meta, drop it entirely
-                    print(f"DEBUG: Dropping zero-priced item: {it.item}")
+                    print(f"DEBUG[/upload]: Dropping zero-priced item: {it.item}")
                     continue
                 filtered_items.append(it)
             normalized_items = filtered_items
@@ -1067,9 +1309,41 @@ async def upload(
             if pricing_totals["low"] > 0 or pricing_totals["high"] > 0:
                 meta["pricing_totals"] = pricing_totals
                 meta["pricing_used"] = True
+            print("DEBUG[/upload]: pricing_totals:", pricing_totals)
         except Exception as e:
+            print("DEBUG[/upload]: pricing error:", e)
             meta["pricing_error"] = str(e)
 
+    # --- Provider search (Google Places) ---
+    providers_by_category: Dict[str, List[Dict]] = {}
+
+    print("DEBUG[/upload]: starting provider lookup")
+    print("DEBUG[/upload]: GOOGLE_MAPS_API_KEY present:", bool(GOOGLE_MAPS_API_KEY))
+    print("DEBUG[/upload]: address from form:", repr(address))
+    print("DEBUG[/upload]: normalized_items count:", len(normalized_items))
+
+    if GOOGLE_MAPS_API_KEY and address and normalized_items:
+        coords = geocode_address(address)
+        print("DEBUG[/upload]: geocode_address returned coords:", coords)
+        if coords:
+            lat, lng = coords
+            used_categories = sorted({it.category for it in normalized_items})
+            print("DEBUG[/upload]: unique categories to search providers for:", used_categories)
+
+            for cat in used_categories:
+                try:
+                    providers = find_providers_for_category(cat, lat, lng)
+                    providers_by_category[cat] = providers
+                    print(f"DEBUG[/upload]: category={cat!r}, providers_found={len(providers)}")
+                except Exception as e:
+                    print(f"DEBUG[/upload]: Provider search error for {cat}: {e}")
+        else:
+            print("DEBUG[/upload]: coords is None, skipping provider search")
+    else:
+        print("DEBUG[/upload]: skipping provider search due to missing key/address/items")
+
+    meta["providers"] = providers_by_category
+    print("DEBUG[/upload]: final providers_by_category keys:", list(providers_by_category.keys()))
 
     # Build display items
     for it in normalized_items:
@@ -1103,6 +1377,9 @@ async def upload(
             currency=it.price.currency if it.price else None,
         ))
 
+    print("DEBUG[/upload]: items_for_display count:", len(items_for_display))
+    print("DEBUG[/upload]: returning ParsedResponse")
+
     return ParsedResponse(
         address=address or None,
         notes=notes or None,
@@ -1113,3 +1390,4 @@ async def upload(
     )
 
 # Run: uvicorn app:app --reload
+
