@@ -18,7 +18,8 @@ from pathlib import Path
 AI_PROVIDER = os.getenv("AI_PROVIDER", "claude")  # "claude" or "openai"
 
 # Claude setup
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+#CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MAX_TOKENS = 200000
 CLAUDE_RESPONSE_MAX_TOKENS = 8192

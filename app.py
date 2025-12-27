@@ -1,3 +1,6 @@
+# app.py — FULL DROP-IN REPLACEMENT
+# Change in this version: ✅ Stable, deterministic sort of normalized_items BEFORE pricing
+# so item indexes (and therefore pricing attachment) are consistent across runs.
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -13,48 +16,23 @@ from PIL import Image
 import pytesseract
 import io, re, os, json
 from pathlib import Path
-
-import requests  # HTTP client for Google APIs
+import requests
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 print("DEBUG[config]: GOOGLE_MAPS_API_KEY present:", bool(GOOGLE_MAPS_API_KEY))
 
-# ---------------- AI client setup ----------------
-AI_PROVIDER = os.getenv("AI_PROVIDER", "claude")  # "claude" or "openai"
-print("DEBUG[config]: AI_PROVIDER =", AI_PROVIDER)
-
-# Claude setup
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# ---------------- Claude-only AI client setup ----------------
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MAX_TOKENS = 200000
-CLAUDE_RESPONSE_MAX_TOKENS = 8192
 
-# OpenAI setup
-OPENAI_MODEL = "gpt-5"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MAX_TOKENS = 128000
-OPENAI_RESPONSE_MAX_TOKENS = 16000
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "200000"))
+CLAUDE_RESPONSE_MAX_TOKENS = int(os.getenv("CLAUDE_RESPONSE_MAX_TOKENS", "8192"))
 
-# Set active config based on provider
-if AI_PROVIDER.lower() == "claude":
-    MODEL_NAME = CLAUDE_MODEL
-    API_KEY = ANTHROPIC_API_KEY
-    MAX_TOKENS = CLAUDE_MAX_TOKENS
-    RESPONSE_MAX_TOKENS = CLAUDE_RESPONSE_MAX_TOKENS
-else:
-    MODEL_NAME = OPENAI_MODEL
-    API_KEY = OPENAI_API_KEY
-    MAX_TOKENS = OPENAI_MAX_TOKENS
-    RESPONSE_MAX_TOKENS = OPENAI_RESPONSE_MAX_TOKENS
+print("DEBUG[config]: CLAUDE_MODEL =", CLAUDE_MODEL)
+print("DEBUG[config]: ANTHROPIC_API_KEY present:", bool(ANTHROPIC_API_KEY))
+print("DEBUG[config]: CLAUDE_MAX_TOKENS =", CLAUDE_MAX_TOKENS, "CLAUDE_RESPONSE_MAX_TOKENS =", CLAUDE_RESPONSE_MAX_TOKENS)
 
-print("DEBUG[config]: MODEL_NAME =", MODEL_NAME)
-print("DEBUG[config]: API_KEY present:", bool(API_KEY))
-print("DEBUG[config]: MAX_TOKENS =", MAX_TOKENS, "RESPONSE_MAX_TOKENS =", RESPONSE_MAX_TOKENS)
-
-# Initialize clients
 _anthropic_client = None
-_openai_client = None
-
 try:
     import anthropic
     _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -63,22 +41,14 @@ except Exception as e:
     print("DEBUG[config]: Error initializing Anthropic client:", e)
     _anthropic_client = None
 
-try:
-    from openai import OpenAI
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    print("DEBUG[config]: OpenAI client initialized:", bool(_openai_client))
-except Exception as e:
-    print("DEBUG[config]: Error initializing OpenAI client:", e)
-    _openai_client = None
-
 # ---------------- App setup ----------------
 app = FastAPI(title="Inspectomatic – AI-Powered Extraction")
 
 BASE_DIR = Path(__file__).resolve().parent
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "web" / "static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "web"))
 
-# ---------------- Categories (expanded) ----------------
+# ---------------- Categories ----------------
 CATEGORIES = [
     "Plumbing",
     "Electrical",
@@ -104,7 +74,6 @@ CATEGORIES = [
     "Septic & Well Systems",
 ]
 
-# Frequency order (borderline → prefer earlier)
 FREQUENCY_ORDER = [
     "Plumbing",
     "Electrical",
@@ -129,8 +98,8 @@ FREQUENCY_ORDER = [
     "Waterproofing & Mold",
     "General Contractor (Multi-Trade)",
 ]
+FREQ_TEXT = ", ".join(FREQUENCY_ORDER)
 
-# Category → providers (reference for downstream agent)
 CATEGORY_PROVIDER_MAP: Dict[str, Dict[str, list]] = {
     "Plumbing": {"providers": ["Plumber", "Plumbing Contractor"]},
     "Electrical": {"providers": ["Electrician", "Electrical Contractor"]},
@@ -155,10 +124,7 @@ CATEGORY_PROVIDER_MAP: Dict[str, Dict[str, list]] = {
     "Minor Handyman Repairs": {"providers": ["Handyman"]},
     "Septic & Well Systems": {"providers": ["Septic Service / Pumping", "Onsite Wastewater Contractor", "Well & Pump Contractor"]},
 }
-MAPPING_TEXT = json.dumps(CATEGORY_PROVIDER_MAP, ensure_ascii=False)
-FREQ_TEXT = ", ".join(FREQUENCY_ORDER)
 
-# ---------------- Default category explanations ----------------
 DEFAULT_EXPLANATION_BY_CATEGORY = {
     "Plumbing": "Requires plumbing knowledge for proper water/drain connections, venting, and code compliance.",
     "Electrical": "Requires electrical licensing, safe de-energizing, and code-compliant wiring/GFCI/AFCI work.",
@@ -188,8 +154,8 @@ class PriceEstimate(BaseModel):
     low: float
     high: float
     currency: str = "USD"
-    basis: str = "per job"  # "per job", "per unit", etc.
-    confidence: str = "medium"  # "low" | "medium" | "high"
+    basis: str = "per job"
+    confidence: str = "medium"
     notes: Optional[str] = None
 
 class LineItem(BaseModel):
@@ -225,30 +191,143 @@ class ParsedResponse(BaseModel):
     ignored_examples: Optional[List[IgnoredExample]] = None
     meta: Optional[Dict] = None
 
+# ---------------- Helpers ----------------
+def _coerce_json(text: str):
+    if not text:
+        return {}
+    s = str(text).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[\w-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    m = re.search(r"(\{.*\}|\[.*\])", s, re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            return {}
+    return {}
+
+def _num(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().replace("$", "").replace(",", "")
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def chunk_text_by_tokens(text: str, max_tokens: int) -> List[str]:
+    max_chars = max_tokens * 4
+    if len(text) <= max_chars:
+        return [text]
+    sections = re.split(r"\n\s*\n", text)
+    chunks: List[str] = []
+    current = ""
+    for section in sections:
+        if len(current) + len(section) + 2 <= max_chars:
+            current += ("\n\n" + section) if current else section
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = section
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+def _sample_snippets(text: str, n: int = 3, snippet_chars: int = 900) -> List[str]:
+    if not text:
+        return []
+    t = text.strip()
+    if len(t) <= snippet_chars:
+        return [t]
+    positions = []
+    for k in range(n):
+        base = int((k + 1) * len(t) / (n + 1))
+        jitter = int((k + 1) * 37)
+        pos = max(0, min(len(t) - snippet_chars, base + jitter))
+        positions.append(pos)
+    return [t[p:p + snippet_chars] for p in positions]
+
+# ---------------- Canonicalization + ✅ stable sort ----------------
+_STOPWORDS = {
+    "please","ensure","properly","all","the","a","an","that","to","be","is","are","needs","need",
+    "should","with","of","for","on","in","at","and"
+}
+
+def _canon(s: str) -> str:
+    if not s:
+        return ""
+    t = str(s).lower()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    # remove common filler
+    t = re.sub(r"\b(" + "|".join(sorted(_STOPWORDS)) + r")\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _cat_rank(cat: str) -> int:
+    try:
+        return FREQUENCY_ORDER.index(cat)
+    except ValueError:
+        return 999
+
+def sort_items_stably(items: List[NormalizedLineItem]) -> List[NormalizedLineItem]:
+    """
+    ✅ Deterministic, stable ordering so pricing indexes map consistently.
+    Sort key:
+      1) category rank (FREQUENCY_ORDER)
+      2) canonical item text
+      3) canonical location (if any)
+      4) canonical verbatim (tie-break)
+    """
+    return sorted(
+        items,
+        key=lambda it: (
+            _cat_rank(it.category or ""),
+            _canon(it.item or ""),
+            _canon(it.location or ""),
+            _canon(it.verbatim or ""),
+        ),
+    )
+
 # ---------------- Text extraction ----------------
-def extract_pages_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF, prefer native text; OCR as fallback."""
+def extract_pages_text_from_pdf(file_bytes: bytes) -> Tuple[str, int, str]:
+    """
+    Returns: (full_text, num_pages, first_pages_text)
+    """
     print("DEBUG[extract_pages_text_from_pdf]: starting")
+    num_pages = 0
+    pages_text: List[str] = []
+
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        pages_text = []
+        num_pages = len(reader.pages)
         for page in reader.pages:
-            text = page.extract_text() or ""
-            pages_text.append(text.strip())
+            pages_text.append((page.extract_text() or "").strip())
         combined = "\n\n".join(pages_text).strip()
-        print("DEBUG[extract_pages_text_from_pdf]: extracted chars:", len(combined))
+        first_pages_text = "\n\n".join(pages_text[:2]).strip()
+        print("DEBUG[extract_pages_text_from_pdf]: native extracted chars:", len(combined), "pages:", num_pages)
         if len(combined) > 100:
-            return combined
+            return combined, num_pages, first_pages_text
     except Exception as e:
-        print("DEBUG[extract_pages_text_from_pdf]: error with native text:", e)
+        print("DEBUG[extract_pages_text_from_pdf]: native text error:", e)
 
     try:
         print("DEBUG[extract_pages_text_from_pdf]: falling back to OCR")
         images = convert_from_bytes(file_bytes, fmt="png", dpi=300)
-        ocr_text = [pytesseract.image_to_string(img) for img in images]
-        combined = "\n\n".join(ocr_text).strip()
-        print("DEBUG[extract_pages_text_from_pdf]: OCR extracted chars:", len(combined))
-        return combined
+        num_pages = len(images)
+        ocr_pages = [pytesseract.image_to_string(img) for img in images]
+        combined = "\n\n".join([p.strip() for p in ocr_pages]).strip()
+        first_pages_text = "\n\n".join([p.strip() for p in ocr_pages[:2]]).strip()
+        print("DEBUG[extract_pages_text_from_pdf]: OCR extracted chars:", len(combined), "pages:", num_pages)
+        return combined, num_pages, first_pages_text
     except Exception as e:
         print("DEBUG[extract_pages_text_from_pdf]: OCR failure:", e)
         raise HTTPException(status_code=400, detail=f"Could not extract text from PDF: {e}")
@@ -264,7 +343,99 @@ def extract_text_from_image(file_bytes: bytes) -> str:
         print("DEBUG[extract_text_from_image]: failure:", e)
         raise HTTPException(status_code=400, detail=f"Image OCR failed: {e}")
 
-# ---------------- Enhanced System Prompt ----------------
+# ---------------- Open-set doc classifier (LLM Gate) ----------------
+DOC_GATE_SYSTEM = """
+You are a strict document classifier for a real estate repair-scoping tool.
+
+The tool ONLY supports analyzing:
+1) Home Inspection Reports (multi-page reports describing inspection findings), OR
+2) Repair/Replacement Proposals (short forms or addenda listing repairs to be performed)
+
+If it is not clearly one of those, refuse.
+
+Return JSON ONLY:
+{
+  "in_domain": true|false,
+  "doc_type": "inspection_report"|"repair_proposal"|"unknown",
+  "confidence": "high"|"medium"|"low",
+  "doc_label": "Inspection Report"|"Repair Proposal"|"Unknown"|"Unsupported Document",
+  "reason": "<one sentence explanation>"
+}
+
+Rules:
+- If not clearly inspection/proposal: in_domain=false, doc_type="unknown", doc_label="Unsupported Document".
+- Use page_count as a strong clue but not the only one.
+- Prefer refusing over guessing when uncertain.
+"""
+
+def classify_document_llm(page_count: int, first_pages_text: str, snippets: List[str]) -> Dict:
+    if not ANTHROPIC_API_KEY or not _anthropic_client:
+        return {
+            "in_domain": True,
+            "doc_type": "unknown",
+            "confidence": "low",
+            "doc_label": "Unknown",
+            "reason": "Classifier unavailable (Anthropic not configured)."
+        }
+
+    payload = {
+        "page_count": int(page_count or 0),
+        "first_pages_text": (first_pages_text or "").strip()[:8000],
+        "snippets": [(s or "")[:1200] for s in (snippets or [])[:4]],
+    }
+
+    user_msg = f"""Classify this document.
+
+INPUT (JSON):
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    try:
+        resp = _anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=700,
+            temperature=0,
+            system=DOC_GATE_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = resp.content[0].text if resp.content else "{}"
+        parsed = _coerce_json(raw)
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        in_domain = bool(parsed.get("in_domain", False))
+        doc_type = str(parsed.get("doc_type", "unknown"))
+        conf = str(parsed.get("confidence", "low"))
+        label = str(parsed.get("doc_label", "Unknown"))
+        reason = str(parsed.get("reason", "")).strip() or "No reason provided."
+
+        if doc_type not in ("inspection_report", "repair_proposal", "unknown"):
+            doc_type = "unknown"
+        if conf not in ("high", "medium", "low"):
+            conf = "low"
+        if not in_domain:
+            doc_type = "unknown"
+            label = "Unsupported Document"
+        if label not in ("Inspection Report", "Repair Proposal", "Unknown", "Unsupported Document"):
+            label = "Unknown" if in_domain else "Unsupported Document"
+
+        return {
+            "in_domain": in_domain,
+            "doc_type": doc_type,
+            "confidence": conf,
+            "doc_label": label,
+            "reason": reason,
+        }
+    except Exception as e:
+        print("DEBUG[classify_document_llm]: exception:", e)
+        return {
+            "in_domain": True,
+            "doc_type": "unknown",
+            "confidence": "low",
+            "doc_label": "Unknown",
+            "reason": f"Classifier error: {e}"
+        }
+
+# ---------------- Extraction prompts ----------------
 NEGATIVE_EXAMPLES = """
 NEVER EXTRACT these meta-instructions:
 - "Seller to repair all items outlined in attached Inspection Report"
@@ -278,247 +449,145 @@ NEVER EXTRACT these meta-instructions:
 - "Repair/Replacement to be made on the following items"
 - "The following items require repair or replacement"
 - "See following items for repairs needed"
-
-DO EXTRACT specific actionable tasks:
-- "Replace broken window pane in master bedroom"
-- "Seal gap around exterior door frame with caulk"
-- "Install GFCI outlet in guest bathroom"
-- "Repair loose handrail on front porch steps"
-- "Clean gutters and downspouts"
 """
 
-SYSTEM_PROMPT = f"""Think very carefully in your answers, reason through everything step by step.
+SYSTEM_PROMPT_PROPOSAL = f"""Think carefully.
 
-CRITICAL FILTERING RULE: Only extract specific, actionable repair tasks that a contractor can quote and complete. IGNORE all meta-instructions, general directives, and summary statements about completing work.
+Only extract specific, actionable repair tasks that a contractor can quote and complete.
+Ignore meta-instructions and boilerplate.
 
 {NEGATIVE_EXAMPLES}
 
-You are an expert inspection report analyzer for Inspectomatic, a real estate tool that helps buyers and sellers negotiate repair costs by providing accurate categorization and cost estimates. Your job is to transform overwhelming inspection reports into organized, actionable repair lists that contractors can quote and complete.
-
-CORE MISSION: Extract EVERY actionable repair/maintenance item and categorize it by the **service provider who would actually do the work**. Skip any organizational language, summary statements, or instructions about who should complete work.
-
-FILTERING CRITERIA:
-- EXTRACT: Specific tasks with clear actions (repair, replace, install, seal, clean, adjust)
-- SKIP: General instructions, summary statements, references to "all items" or "per report"
-- SKIP: Lines that talk about "the following items", "items below", or "these items" without naming a specific repair
-- SKIP: Lines mentioning "seller," "buyer," "outlined in," "attached," "blue tape," "complete all"
+This document is a repair proposal / negotiation form.
+Extract ONLY concrete repair/replace tasks as contractor scope.
 
 Use EXACTLY these category names:
 {", ".join(CATEGORIES)}
 
-When borderline between categories, prefer the earlier one in this frequency list:
+When borderline, prefer earlier in:
 {FREQ_TEXT}
 
-UNIQUENESS & SPLITTING:
-- From any single source line, output **either** ONE handyman item (if a competent handyman can reasonably do the work) **or** multiple trade-specific items — **never both**.
-- Do **not** duplicate the same action across multiple categories.
-
-GROUPING RULE (SAME-LINE ONLY):
-- If ONE inspection line describes the SAME repair action in multiple locations
-  (e.g., “seal 3 gaps…”, “recaulk guest & master showers”, “repair siding in two areas”),
-  output ONE grouped item.
-- Use qty = number of locations/gaps/areas, units = "gaps"/"areas"/etc., and location =
-  a short summary naming all locations.
-- Do NOT group items from different lines or different actions. Multiple items per trade
-  are expected when tasks are distinct.
-- Only group same-action, same-line repetitions — everything else stays separate.
-
-HANDYMAN CONSOLIDATION PRIORITY:
-- **MINIMIZE TOTAL CONTRACTORS** - When in doubt between a specialist and handyman, choose **"Minor Handyman Repairs"** to reduce the number of professionals needed
-- Only use specialists for work that truly requires licensing, permits, or specialized tools/knowledge
-- Prioritize practical job completion over theoretical trade boundaries
-
-Handyman-appropriate work includes:
-- Simple door installations, hardware, and basic trim work
-- Access panels, hatches, and basic openings (attic access, crawl space doors)
-- Basic shelving installation and simple carpentry
-- Minor caulking, touch-up paint, and small patches
-- Simple plumbing fixtures (toilet seats, basic hardware) - but NOT major plumbing repairs
-- Basic electrical work like outlet covers, switch plates - but NOT wiring or panel work
-
-SPECIALIST-ONLY categories (do NOT move to handyman):
-- Major plumbing: pipe repairs, water heater work, drain clearing, fixture installation requiring plumbing knowledge
-- Electrical: any wiring, breaker panels, GFCI installation, electrical troubleshooting
-- HVAC: any system repairs, ductwork, unit repairs, damper adjustments
-- Roofing: anything involving roof structure, shingles, major flashing
-- Major structural work requiring permits
-
-GENERAL CONTRACTOR POLICY:
-- **Reserve "General Contractor (Multi-Trade)" for scopes that clearly require multi-trade coordination and permitting.**
-- Do **not** use GC for single-trade work like **sistering rafters**, **rebuilding a deck**, **replacing siding**, **window glass**, etc.
-
-DISAMBIGUATION HINTS:
-- Wastewater systems (septic tank pumping/repairs) → **Septic & Well Systems**.
-- Fogged/failed insulated glass → **Windows/Glass**. Mirror cord/hardware → **Minor Handyman Repairs**.
-- Ducts/returns/airflow/drain pan → **HVAC**.
-- Exterior wall boxes/panels/siding sealing → **Siding & Exterior Envelope**.
-- Interior trim/baseboard caulk & paint → **Minor Handyman Repairs** (unless it's clearly a whole-house repaint handled by a painter).
-- Retaining wall construction → **Masonry & Concrete**; post-install backfill/grading → **Landscaping & Drainage**.
-- **Sistering rafters/roof framing** → **Roofing** (or Carpentry if explicitly framed as interior framing).
-- **Deck rebuild/bring to code** → **Carpentry & Trim**.
-- **Simple access doors, hatches, basic hardware** → **Minor Handyman Repairs**.
-
-Output JSON format:
+Output JSON:
 {{
   "items": [
     {{
-      "category": "<one of the categories above>",
-      "item": "<actionable task>",
+      "category": "<category>",
+      "item": "<contractor-quotable task>",
       "verbatim": "<exact source text>",
       "location": "<where if given>",
       "qty": <number or null>,
       "units": "<units or null>",
       "severity": "low|medium|high",
-      "explanation": "<REQUIRED: explain why this category vs. handyman - what specialized knowledge, tools, or licensing is needed>"
+      "explanation": "<why this category vs. handyman>"
     }}
   ],
-  "ignored_examples": [
-    {{
-      "verbatim": "<non-actionable text>",
-      "why": "<short reason>"
-    }}
-  ],
+  "ignored_examples": [{{"verbatim":"...", "why":"..."}}],
   "property_address": "<if found>",
   "total_items_found": <number>
 }}
-
-EXPLANATION REQUIREMENTS:
-- For "Minor Handyman Repairs": Brief explanation like "Basic hardware installation" or "Simple repair within handyman scope"
-- For specialist categories: MUST explain why a specialist is needed over a handyman
-  * Plumbing: "Requires plumbing knowledge for proper connections/drainage/water pressure"
-  * Electrical: "Requires electrical licensing and knowledge of wiring/safety codes" 
-  * HVAC: "Requires HVAC certification and specialized tools for system diagnostics"
-  * Roofing: "Requires roofing expertise and safety equipment for structural work"
-  * Carpentry & Trim: "Requires advanced carpentry skills beyond basic handyman scope"
-  * etc.
 """
 
-# Pricing system prompt
+SYSTEM_PROMPT_INSPECTION = f"""Think carefully.
+
+Only extract specific, actionable repair tasks that a contractor can quote and complete.
+Skip SOP/limitations/disclaimer/educational content.
+
+{NEGATIVE_EXAMPLES}
+
+This document is a home inspection report.
+Transform findings into contractor-quotable repair scope items.
+
+Use EXACTLY these category names:
+{", ".join(CATEGORIES)}
+
+When borderline, prefer earlier in:
+{FREQ_TEXT}
+
+Output JSON:
+{{
+  "items": [
+    {{
+      "category": "<category>",
+      "item": "<contractor-quotable task>",
+      "verbatim": "<exact source text>",
+      "location": "<where if given>",
+      "qty": <number or null>,
+      "units": "<units or null>",
+      "severity": "low|medium|high",
+      "explanation": "<why this category vs. handyman>"
+    }}
+  ],
+  "ignored_examples": [{{"verbatim":"...", "why":"..."}}],
+  "property_address": "<if found>",
+  "total_items_found": <number>
+}}
+"""
+
+def _active_system_prompt(doc_type: str) -> str:
+    return SYSTEM_PROMPT_PROPOSAL if doc_type == "repair_proposal" else SYSTEM_PROMPT_INSPECTION
+
+# ---------------- Pricing (coverage-guaranteed) ----------------
 PRICING_SYSTEM_PROMPT = """
 You are a home repair cost estimator for a tool used in real estate deals.
-You will be given a list of repair items that have already been categorized by trade.
 
-Your job:
-- For EACH item, estimate a realistic price RANGE in USD (low and high).
-- These are ballpark estimates for negotiation, not binding quotes.
-- Assume work is being done by properly insured, professional contractors (not unlicensed handymen),
-  in a typical mid-cost U.S. metro area, unless otherwise indicated by the address.
+CRITICAL REQUIREMENT:
+- You MUST return exactly ONE pricing object for EACH input item index.
+- The output "items" array length MUST equal the number of input objects.
+- Every input index MUST appear exactly once in the output.
+- If you are uncertain, make reasonable assumptions and still return a best-effort range.
 
-RANGE TIGHTNESS RULES (VERY IMPORTANT):
-- Your goal is to provide **usable, fairly tight negotiation ranges**, not huge uncertainty bands.
-- In normal cases:
-  * HIGH should typically be within about **20–40% above LOW**.
-  * As a numeric guideline, in most cases use:  high ≈ low * 1.2 to low * 1.4
-- Only widen the range more than this when there is clear, explicit uncertainty in scope
-  (e.g. "may need full replacement", "extent of damage unknown").
-- Avoid very wide bands like "$500–$2,500" unless truly unavoidable. It is better to choose
-  your best judgment around a narrower range that would be reasonable for negotiations.
+Pricing rules:
+- Estimate a realistic price RANGE in USD (low and high).
+- Keep ranges fairly tight: in normal cases high is ~1.2x to 1.4x low.
+- Only widen if scope uncertainty is explicit in the item text.
+- If qty + units are provided, scale the range accordingly.
+- Severity guide:
+  * low = minor repair/tune-up
+  * medium = moderate repair/partial replacement
+  * high = major repair/likely replacement
 
-Other rules:
-- Always return prices in USD.
-- If quantity is provided (qty + units), scale your range accordingly.
-- Severity:
-  * low: minor repair or tune-up
-  * medium: moderate repair or partial replacement
-  * high: major repair or likely full replacement
-
-When thinking about the numbers:
-- Imagine what 2–3 local pros would actually quote.
-- LOW should represent a solid but not "cut-rate" contractor.
-- HIGH should represent the upper end of typical quotes, not extreme outliers.
-
-Output JSON ONLY in this format:
+Output JSON ONLY:
 {
   "items": [
     {
-      "index": <int matching input index>,
-      "price_low": <float>,
-      "price_high": <float>,
+      "index": <int>,
+      "price_low": <number>,
+      "price_high": <number>,
       "currency": "USD",
       "basis": "per job" | "per unit" | "per sq ft" | "per linear ft",
       "confidence": "low" | "medium" | "high",
-      "notes": "<short note explaining what you assumed for pricing>"
+      "notes": "<short assumptions>"
     }
   ]
 }
 """
 
-def chunk_text_by_tokens(text: str, max_tokens: int) -> List[str]:
-    max_chars = max_tokens * 4
-    if len(text) <= max_chars:
-        return [text]
-    sections = re.split(r'\n\s*\n', text)
-    chunks: List[str] = []
-    current = ""
-    for section in sections:
-        if len(current) + len(section) + 2 <= max_chars:
-            current += ("\n\n" + section) if current else section
-        else:
-            if current:
-                chunks.append(current.strip())
-            current = section
-    if current:
-        chunks.append(current.strip())
-    return chunks
-
-# ---------- JSON coercion hardening ----------
-def _coerce_json(text: str):
-    if not text:
-        return {}
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[\w-]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    m = re.search(r'(\{.*\}|\[.*\])', s, re.S)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            return {}
-    return {}
-
-# ---------------- AI extraction/pricing wrappers ----------------
-def call_ai_extraction(text: str, address: str = "") -> dict:
-    print("DEBUG[call_ai_extraction]: provider =", AI_PROVIDER, "chars=", len(text))
-    if AI_PROVIDER.lower() == "claude":
-        return call_claude_extraction(text, address)
-    else:
-        return call_openai_extraction(text, address)
-
-def call_claude_extraction(text: str, address: str = "") -> dict:
+def call_claude_extraction(text: str, address: str = "", doc_type: str = "inspection_report") -> dict:
     if not ANTHROPIC_API_KEY or not _anthropic_client:
-        print("DEBUG[call_claude_extraction]: Anthropic not configured")
         return {"items": [], "ignored_examples": [], "error": "Anthropic API not configured"}
 
-    try:
-        user_message = f"""FILTERING REMINDER: Skip meta-instructions like "seller to repair all items" - only extract specific tasks.
+    system_prompt = _active_system_prompt(doc_type)
+    user_message = f"""Only extract specific actionable repair tasks (not boilerplate).
 
-CRITICAL: Output JSON format with explanations for each item explaining why that category vs handyman.
-
+Document Type: {doc_type}
 Property Address: {address}
 
 Document Content:
-
-{text}"""
-
-        response = _anthropic_client.messages.create(
+{text}
+"""
+    try:
+        resp = _anthropic_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=CLAUDE_RESPONSE_MAX_TOKENS,
             temperature=0,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}]
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
         )
-
-        result_text = response.content[0].text if response.content else "{}"
-        print("\n=== DEBUG: Raw Claude Extraction (first 500 chars) ===")
-        print(result_text[:500])
+        raw = resp.content[0].text if resp.content else "{}"
+        print("\n=== DEBUG: Raw Claude Extraction (first 700 chars) ===")
+        print(raw[:700])
         print("=" * 50)
-
-        parsed = _coerce_json(result_text)
+        parsed = _coerce_json(raw)
         if isinstance(parsed, list):
             parsed = {"items": parsed, "ignored_examples": []}
         return parsed if isinstance(parsed, dict) else {"items": [], "ignored_examples": []}
@@ -526,336 +595,164 @@ Document Content:
         print("DEBUG[call_claude_extraction]: exception:", e)
         return {"items": [], "ignored_examples": [], "error": str(e)}
 
-def call_openai_extraction(text: str, address: str = "") -> dict:
-    if not OPENAI_API_KEY or not _openai_client:
-        print("DEBUG[call_openai_extraction]: OpenAI not configured")
-        return {"items": [], "ignored_examples": [], "error": "OpenAI API not configured"}
+def _call_claude_pricing_batch(payload: List[dict], address: str) -> dict:
+    user_message = f"""
+Property Address (may help you infer region): {address or "Unknown"}
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"""FILTERING REMINDER: Skip meta-instructions like "seller to repair all items" - only extract specific tasks.
+INPUT ITEMS (array of objects). Output MUST include one pricing object per input index:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    resp = _anthropic_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=3500,
+        temperature=0,
+        system=PRICING_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    raw = resp.content[0].text if resp.content else "{}"
+    print("\n=== DEBUG: Raw Claude Pricing (first 900 chars) ===")
+    print(raw[:900])
+    print("=" * 50)
+    return _coerce_json(raw) or {}
 
-CRITICAL: Output JSON and include an "explanation" for every item explaining why that category vs. handyman.
-
-Property Address: {address}
-
-Document Content:
-
-{text}"""}
-    ]
-    try:
-        resp = _openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0,
-            top_p=0.1,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
-            max_tokens=RESPONSE_MAX_TOKENS,
-        )
-        result_text = resp.choices[0].message.content
-        print("\n=== DEBUG: Raw OpenAI Extraction (first 500 chars) ===")
-        print(result_text[:500])
-        print("=" * 50)
-        parsed = _coerce_json(result_text)
-        if isinstance(parsed, list):
-            parsed = {"items": parsed, "ignored_examples": []}
-        return parsed if isinstance(parsed, dict) else {"items": [], "ignored_examples": []}
-    except Exception as e:
-        print("DEBUG[call_openai_extraction]: exception:", e)
-        return {"items": [], "ignored_examples": [], "error": str(e)}
-
-def call_claude_pricing(items: List[NormalizedLineItem], address: str = "") -> Dict[int, PriceEstimate]:
+def call_claude_pricing(
+    items: List["NormalizedLineItem"],
+    address: str = "",
+    batch_size: int = 15,
+    max_passes: int = 2
+) -> Dict[int, PriceEstimate]:
     if not ANTHROPIC_API_KEY or not _anthropic_client:
         print("DEBUG[call_claude_pricing]: Anthropic not configured")
         return {}
 
-    payload = []
-    for idx, it in enumerate(items):
-        payload.append({
-            "index": idx,
-            "category": it.category,
-            "item": it.item,
-            "location": it.location,
-            "severity": it.severity,
-            "qty": it.qty,
-            "units": it.units,
-        })
+    total = len(items)
+    out: Dict[int, PriceEstimate] = {}
 
-    user_message = f"""
-Property Address (may help you infer region): {address or "Unknown"}
+    def build_payload(indexes: List[int]) -> List[dict]:
+        payload = []
+        for idx in indexes:
+            it = items[idx]
+            payload.append({
+                "index": idx,
+                "category": it.category,
+                "item": it.item,
+                "location": it.location,
+                "severity": it.severity,
+                "qty": it.qty,
+                "units": it.units,
+            })
+        return payload
 
-Here are the repair items to price (array of objects):
-{json.dumps(payload, ensure_ascii=False)}
-"""
-    try:
-        response = _anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            temperature=0,
-            system=PRICING_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}]
-        )
-        result_text = response.content[0].text if response.content else "{}"
-        print("\n=== DEBUG: Raw Claude Pricing (first 500 chars) ===")
-        print(result_text[:500])
-        print("=" * 50)
-
-        parsed = _coerce_json(result_text)
+    def ingest(parsed: dict):
         if not isinstance(parsed, dict):
-            return {}
-
-        out: Dict[int, PriceEstimate] = {}
-        for obj in parsed.get("items", []):
+            return
+        arr = parsed.get("items", [])
+        if not isinstance(arr, list):
+            return
+        for obj in arr:
+            if not isinstance(obj, dict):
+                continue
             try:
                 idx = int(obj.get("index"))
             except Exception:
                 continue
+            low = _num(obj.get("price_low"))
+            high = _num(obj.get("price_high"))
+            if low is None or high is None:
+                continue
             try:
-                pe = PriceEstimate(
-                    low=float(obj.get("price_low", 0.0)),
-                    high=float(obj.get("price_high", 0.0)),
-                    currency=obj.get("currency", "USD"),
-                    basis=obj.get("basis", "per job"),
-                    confidence=obj.get("confidence", "medium"),
-                    notes=obj.get("notes")
+                out[idx] = PriceEstimate(
+                    low=float(low),
+                    high=float(high),
+                    currency=(obj.get("currency") or "USD"),
+                    basis=(obj.get("basis") or "per job"),
+                    confidence=(obj.get("confidence") or "medium"),
+                    notes=obj.get("notes"),
                 )
-                out[idx] = pe
             except Exception:
                 continue
-        print("DEBUG[call_claude_pricing]: built pricing map for", len(out), "items")
-        return out
-    except Exception as e:
-        print("DEBUG[call_claude_pricing]: exception:", e)
-        return {}
 
-def call_ai_pricing(items: List[NormalizedLineItem], address: str = "") -> Dict[int, PriceEstimate]:
-    print("DEBUG[call_ai_pricing]: provider =", AI_PROVIDER, "items=", len(items))
-    if AI_PROVIDER.lower() == "claude":
-        return call_claude_pricing(items, address)
-    return {}
+    all_indexes = list(range(total))
 
-# ---------- Provider scoring & Google Places helpers ----------
-def provider_score(rating: float, reviews: int, prior_mean: float = 4.3, prior_weight: int = 20) -> float:
-    """
-    Bayesian-style score so that:
-    - 50 reviews @ 4.8 beats 2 reviews @ 5.0
-    - score → rating as reviews grow
-    """
-    if rating <= 0 or reviews < 0:
-        return 0.0
-    return (rating * reviews + prior_mean * prior_weight) / (reviews + prior_weight)
+    # pass 1
+    for start in range(0, total, batch_size):
+        batch_idxs = all_indexes[start:start + batch_size]
+        payload = build_payload(batch_idxs)
+        try:
+            parsed = _call_claude_pricing_batch(payload, address)
+            ingest(parsed)
+        except Exception as e:
+            print("DEBUG[call_claude_pricing]: batch exception:", e)
 
-def geocode_address(address: str):
-    """Geocode an address to (lat, lng) using Google Geocoding API."""
-    print("DEBUG[geocode_address]: called with address:", repr(address))
-    if not GOOGLE_MAPS_API_KEY:
-        print("DEBUG[geocode_address]: GOOGLE_MAPS_API_KEY is missing/empty")
-        return None
-    if not address:
-        print("DEBUG[geocode_address]: address is empty/falsey")
-        return None
-
-    try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/geocode/json",
-            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
-            timeout=5,
-        )
-        data = resp.json()
-        status = data.get("status")
-        print("DEBUG[geocode_address]: status =", status)
-        if status != "OK":
-            print("DEBUG[geocode_address]: error_message =", data.get("error_message"))
-            return None
-        loc = data["results"][0]["geometry"]["location"]
-        coords = (loc["lat"], loc["lng"])
-        print("DEBUG[geocode_address]: coords =", coords)
-        return coords
-    except Exception as e:
-        print("DEBUG[geocode_address]: exception:", e)
-        return None
-
-def _places_nearby(lat: float, lng: float, keyword: str, radius_m: int) -> list:
-    print(f"DEBUG[_places_nearby]: lat={lat}, lng={lng}, keyword={keyword!r}, radius_m={radius_m}")
-    if not GOOGLE_MAPS_API_KEY:
-        print("DEBUG[_places_nearby]: GOOGLE_MAPS_API_KEY is missing/empty")
-        return []
-    try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
-            params={
-                "key": GOOGLE_MAPS_API_KEY,
-                "location": f"{lat},{lng}",
-                "radius": radius_m,
-                "keyword": keyword,
-            },
-            timeout=5,
-        )
-        data = resp.json()
-        status = data.get("status")
-        print("DEBUG[_places_nearby]: status =", status)
-        if status not in ("OK", "ZERO_RESULTS"):
-            print("DEBUG[_places_nearby]: error_message =", data.get("error_message"))
-        results = data.get("results", [])
-        print(f"DEBUG[_places_nearby]: got {len(results)} raw results")
-        return results
-    except Exception as e:
-        print("DEBUG[_places_nearby]: exception:", e)
-        return []
-
-def _place_details(place_id: str) -> dict:
-    print("DEBUG[_place_details]: called with place_id:", place_id)
-    if not GOOGLE_MAPS_API_KEY:
-        print("DEBUG[_place_details]: GOOGLE_MAPS_API_KEY is missing/empty")
-        return {}
-    if not place_id:
-        print("DEBUG[_place_details]: empty place_id")
-        return {}
-    try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/place/details/json",
-            params={
-                "key": GOOGLE_MAPS_API_KEY,
-                "place_id": place_id,
-                "fields": "formatted_phone_number,website,formatted_address"
-            },
-            timeout=5,
-        )
-        data = resp.json()
-        status = data.get("status")
-        print("DEBUG[_place_details]: status =", status)
-        if status not in ("OK", "ZERO_RESULTS"):
-            print("DEBUG[_place_details]: error_message =", data.get("error_message"))
-        result = data.get("result", {}) or {}
-        print(
-            "DEBUG[_place_details]: has phone:", bool(result.get("formatted_phone_number")),
-            "address:", bool(result.get("formatted_address"))
-        )
-        return result
-    except Exception as e:
-        print("DEBUG[_place_details]: exception:", e)
-        return {}
-
-def find_providers_for_category(category: str, lat: float, lng: float) -> list:
-    """
-    Expand radius until we have enough candidates, then score and pick top 3.
-    - radii: 10, 20, 40 miles
-    - require rating >= 4.0 and reviews >= 5
-    - use Bayesian provider_score(rating, reviews)
-    """
-    labels = CATEGORY_PROVIDER_MAP.get(category, {}).get("providers") or [category]
-    keyword = " ".join(labels)
-    print(f"DEBUG[find_providers_for_category]: category={category!r}, keyword={keyword!r}, coords=({lat},{lng})")
-
-    radii_miles = [10, 20, 40]
-    radii = [int(r * 1609.34) for r in radii_miles]
-
-    seen = set()
-    candidates = []
-
-    for r_m, r_miles in zip(radii, radii_miles):
-        print(f"DEBUG[find_providers_for_category]: searching radius {r_miles}mi ({r_m}m)")
-        results = _places_nearby(lat, lng, keyword, r_m)
-        print(f"DEBUG[find_providers_for_category]: radius {r_miles}mi returned {len(results)} results")
-
-        for r in results:
-            pid = r.get("place_id")
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-
-            rating = float(r.get("rating", 0.0))
-            reviews = int(r.get("user_ratings_total", 0))
-
-            if rating < 4.0 or reviews < 5:
-                print(f"DEBUG[find_providers_for_category]: skipping {r.get('name')} rating={rating} reviews={reviews}")
-                continue
-
-            score = provider_score(rating, reviews)
-            candidates.append({
-                "place_id": pid,
-                "name": r.get("name"),
-                "rating": rating,
-                "review_count": reviews,
-                "address": r.get("vicinity"),
-                "score": score,
-            })
-
-        print(f"DEBUG[find_providers_for_category]: cumulative candidates={len(candidates)} after {r_miles}mi")
-        if len(candidates) >= 15:
+    # retries
+    for pass_i in range(1, max_passes + 1):
+        missing = [i for i in all_indexes if i not in out]
+        if not missing:
             break
+        print(f"DEBUG[call_claude_pricing]: pass {pass_i} retrying missing={len(missing)}")
+        for start in range(0, len(missing), batch_size):
+            batch_idxs = missing[start:start + batch_size]
+            payload = build_payload(batch_idxs)
+            try:
+                parsed = _call_claude_pricing_batch(payload, address)
+                ingest(parsed)
+            except Exception as e:
+                print("DEBUG[call_claude_pricing]: retry batch exception:", e)
 
-    candidates.sort(key=lambda x: (x["score"], x["review_count"]), reverse=True)
-    top = candidates[:3]
-    print(f"DEBUG[find_providers_for_category]: top {len(top)} candidates selected")
+    print("DEBUG[call_claude_pricing]: built pricing map for", len(out), "of", total, "items")
+    return out
 
-    enriched = []
-    for p in top:
-        details = _place_details(p["place_id"])
-        if details:
-            p["phone"] = details.get("formatted_phone_number")
-            p["website"] = details.get("website")
-            p["address"] = details.get("formatted_address") or p["address"]
-        enriched.append(p)
-
-    print("DEBUG[find_providers_for_category]: enriched providers:", enriched)
-    return enriched
-
-# ---------- Heuristic capture ----------
-NUMBERED_OR_BULLET = re.compile(r'^\s*(?:\d+\s*[\.)-]\s*|[-*•]\s+)?(.+)$', re.MULTILINE)
-REPAIR_HINT = re.compile(
-    r'\b(repair|replace|install|clean|seal|caulk|fix|adjust|service|test|leak|broken|missing|damaged|inoperable|not working|not cooling|paint|trim|flashing)\b',
+# ---------------- Header/numbering filters + fallback ----------------
+NUMBERED_OR_BULLET = re.compile(r"^\s*(?:\d+(?:\.\d+)*\s*[\.)-]?\s*|[-*•]\s+)?(.+)$", re.MULTILINE)
+SECTION_HEADER_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)+\s+[A-Za-z].{0,80}:\s+.+$")
+GENERIC_HEADER_LIKE_PATTERN = re.compile(r"^\s*(?:[A-Z][a-z]+(?:\s*[-/]\s*[A-Z][a-z]+)*)(?:\s*[-–]\s*[A-Z][a-z]+)*\s*:\s+.+$")
+REPAIR_ACTION_HINT = re.compile(
+    r"\b(repair|replace|install|reinstall|secure|tighten|adjust|service|clean|seal|caulk|recaulk|patch|correct|fix|rebuild|reset|regrade|remove|add)\b",
     re.I
 )
-
 META_INSTRUCTION_PATTERN = re.compile(
-    r'\b(seller|buyer|all items|complete all|per report|outlined in|attached|blue tape|remedy all|deficiencies noted|as recommended|noted defects|to be corrected)\b',
+    r"\b(seller|buyer|all items|complete all|per report|outlined in|attached|blue tape|remedy all|deficiencies noted|as recommended|noted defects|to be corrected)\b",
+    re.I
+)
+SUMMARY_PATTERN = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*\s*[\.)-]?\s*)?(?:seller|buyer)\s+(?:to|shall|will|must)\s+(?:repair|complete|address|remedy)",
+    re.I
+)
+INSPECTION_BOILERPLATE_PATTERN = re.compile(
+    r"\b(standards of practice|limitations|exclusions|disclaimer|inspection agreement|scope of inspection)\b",
     re.I
 )
 
-SUMMARY_PATTERN = re.compile(
-    r'^\s*(?:\d+\s*[\.)-]\s*)?(?:seller|buyer)\s+(?:to|shall|will|must)\s+(?:repair|complete|address|remedy)',
-    re.I
-)
+def _looks_like_section_header(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if SECTION_HEADER_PATTERN.search(s):
+        return True
+    if GENERIC_HEADER_LIKE_PATTERN.search(s) and not REPAIR_ACTION_HINT.search(s):
+        return True
+    return False
 
 def simple_fallback_parse(text: str) -> List[LineItem]:
-    print("DEBUG[simple_fallback_parse]: running fallback parser")
     items: List[LineItem] = []
     for m in NUMBERED_OR_BULLET.finditer(text):
         line = (m.group(1) or "").strip()
         if len(line) < 6:
             continue
+        if _looks_like_section_header(line):
+            continue
         if META_INSTRUCTION_PATTERN.search(line):
             continue
         if SUMMARY_PATTERN.search(line):
             continue
-        if re.search(r'\b(report|inspection|recommendations?|items?)\b', line, re.I) and not REPAIR_HINT.search(line):
+        if INSPECTION_BOILERPLATE_PATTERN.search(line):
             continue
-        if REPAIR_HINT.search(line):
+        if REPAIR_ACTION_HINT.search(line):
             items.append(LineItem(category="Minor Handyman Repairs", item_text=line))
-    print("DEBUG[simple_fallback_parse]: found", len(items), "items")
     return items
 
-# ---- Dedupe & arbitration ----
-_WORD = re.compile(r"[a-z0-9]+")
-ACTION_WORDS = {"repair","replace","install","trim","add","seal","caulk","paint","fill","vacuum","reseed","regrade","balance","evaluate","adjust","sister","fasten","secure","patch"}
-
-def _canon(s: str) -> str:
-    if not s:
-        return ""
-    try:
-        t = s.lower()
-        t = re.sub(r"[^a-z0-9\s]", " ", t)
-        t = re.sub(r"\b(please|ensure|properly|all|the|a|an|that|to|be|is|are|needs|need|should|with|of|for|on|in|at|and)\b", " ", t)
-        t = re.sub(r"\s+", " ", t).trim()
-        return t
-    except Exception:
-        return str(s).encode('ascii', 'ignore').decode('ascii').lower().strip()
-
-def _vkey(s: Optional[str]) -> str:
-    return _canon(s or "")
+# ---------------- Dedupe (same as your current lightweight) ----------------
+ACTION_WORDS = {"repair","replace","install","trim","add","seal","caulk","paint","fill","balance","adjust","fasten","secure","patch","correct","clean","recaulk","remove","reinstall"}
 
 def _jaccard(a: str, b: str) -> float:
     A = set(_canon(a).split())
@@ -864,130 +761,51 @@ def _jaccard(a: str, b: str) -> float:
         return 0.0
     return len(A & B) / len(A | B)
 
-HANDY_HINT = re.compile(
-    r"(minor|small|touch ?up|adjust|tighten|hardware|door|hinge|latch|mirror|cord|patch|baseboard|trim|caulk|seal|paint|screws?)",
-    re.I
-)
-HEAVY_HINT = re.compile(
-    r"(septic|pump tank|leach field|well|breaker|panel|gfci|afci|condenser|furnace|coil|duct|rafter|ridge|roof leak|mold|fungal|encapsulation|sump|grading|french drain|retaining wall|insulation|filter|return|duct|septic|window pane|igu|insulated glass)",
-    re.I
-)
-
-def _handyman_eligible(text: str) -> bool:
-    return bool(HANDY_HINT.search(text)) and not bool(HEAVY_HINT.search(text))
-
 def _is_compound(text: str) -> bool:
     tokens = set(_canon(text).split())
     return len(tokens & ACTION_WORDS) >= 2
-
-def _post_categorization_fixups(it: NormalizedLineItem) -> NormalizedLineItem:
-    txt = f"{it.item} {it.verbatim or ''}".lower()
-    if re.search(r"\b(septic|pump tank|leach field|well pump|onsite wastewater)\b", txt):
-        it.category = "Septic & Well Systems"
-    if "mirror" in txt and ("cord" in txt or "power" in txt):
-        it.category = "Minor Handyman Repairs"
-    if re.search(r"\b(caulk|seal)\b", txt) and re.search(r"\b(paint|painted)\b", txt) and re.search(r"\b(trim|baseboard|baseboards)\b", txt):
-        it.category = "Minor Handyman Repairs"
-    return it
-
-def _pick_preferred(a: NormalizedLineItem, b: NormalizedLineItem, context_text: str) -> NormalizedLineItem:
-    if (a.category == "Minor Handyman Repairs" or b.category == "Minor Handyman Repairs") and _handyman_eligible(context_text):
-        return a if a.category == "Minor Handyman Repairs" else b
-    sev_rank = {"high": 3, "medium": 2, "low": 1}
-    sa = sev_rank.get(str(a.severity or "").lower(), 0)
-    sb = sev_rank.get(str(b.severity or "").lower(), 0)
-    if sa != sb:
-        return a if sa > sb else b
-    ia = FREQUENCY_ORDER.index(a.category) if a.category in FREQUENCY_ORDER else 999
-    ib = FREQUENCY_ORDER.index(b.category) if b.category in FREQUENCY_ORDER else 999
-    return a if ia <= ib else b
 
 def _similar_actions(a: NormalizedLineItem, b: NormalizedLineItem) -> bool:
     ak = _canon(a.item + " " + (a.verbatim or ""))
     bk = _canon(b.item + " " + (b.verbatim or ""))
     if len(ak) >= 12 and len(bk) >= 12 and (ak in bk or bk in ak):
         return True
-    sims = [
+    base = max([
         _jaccard(a.item, b.item),
         _jaccard(a.item, b.verbatim or ""),
         _jaccard(a.verbatim or "", b.item),
         _jaccard(a.verbatim or "", b.verbatim or ""),
-    ]
-    base = max(sims)
-    if base >= 0.66:
-        return True
-    DOMAIN_NOUNS = {"siding","drain","pipe","elbow","flashing","panel","mirror","cord","baseboard","trim","rafter","deck","retaining","wall","insulation","filter","return","duct","septic","window","pane","glass","vapor","barrier"}
-    A = set(_canon(a.item).split()) | set(_canon(a.verbatim or "").split())
-    B = set(_canon(b.item).split()) | set(_canon(b.verbatim or "").split())
-    if len((A & B) & DOMAIN_NOUNS) > 0 and base >= 0.52:
-        return True
-    return False
+    ])
+    return base >= 0.72
 
 def dedupe_and_arbitrate(items: List[NormalizedLineItem]) -> List[NormalizedLineItem]:
-    print("DEBUG[dedupe_and_arbitrate]: starting with", len(items), "items")
-    try:
-        fixed = [_post_categorization_fixups(it) for it in items]
-    except Exception as e:
-        print(f"Error in post_categorization_fixups: {e}")
-        fixed = items[:]
+    seen = set()
+    fast = []
+    for it in items:
+        key = (it.category or "", _canon(it.item or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        fast.append(it)
 
+    fixed = fast
     n = len(fixed)
     used = [False] * n
 
-    by_verbatim = {}
+    by_v = {}
     for i, it in enumerate(fixed):
-        try:
-            verbatim_text = getattr(it, 'verbatim', None) or ""
-            if verbatim_text:
-                safe_verbatim = str(verbatim_text).encode('ascii', 'ignore').decode('ascii')
-                vk = _vkey(safe_verbatim)
-            else:
-                vk = f"item_{i}"
-        except Exception as e:
-            print(f"Error processing verbatim for item {i}: {e}")
-            vk = f"item_{i}"
-        by_verbatim.setdefault(vk, []).append(i)
+        vk = _canon(it.verbatim or it.item or "") or f"i{i}"
+        by_v.setdefault(vk, []).append(i)
 
-    for vk, idxs in by_verbatim.items():
-        if len(idxs) == 1:
+    for _, idxs in by_v.items():
+        if len(idxs) <= 1:
             continue
-        try:
-            group_texts = []
-            for i in idxs:
-                text = fixed[i].verbatim or fixed[i].item or ""
-                safe_text = str(text).encode('ascii', 'ignore').decode('ascii') if text else ""
-                group_texts.append(safe_text)
-            group_text = " ".join(group_texts)
-
-            handyman_idxs = [i for i in idxs if fixed[i].category == "Minor Handyman Repairs"]
-            if handyman_idxs and _handyman_eligible(group_text):
-                best = max(handyman_idxs, key=lambda i: len(fixed[i].item or ""))
-                for i in idxs:
-                    used[i] = True
-                used[best] = False
-                continue
-
-            compounds = []
-            for i in idxs:
-                try:
-                    item_text = fixed[i].item or ""
-                    verbatim_text = fixed[i].verbatim or ""
-                    if _is_compound(item_text) or _is_compound(verbatim_text):
-                        compounds.append(i)
-                except Exception as e:
-                    print(f"Error checking compound for item {i}: {e}")
-                    continue
-
-            if len(idxs) > 1 and compounds:
-                for i in compounds:
-                    used[i] = True
-        except Exception as e:
-            print(f"Error processing group {vk}: {e}")
-            continue
+        compounds = [i for i in idxs if _is_compound((fixed[i].item or "") + " " + (fixed[i].verbatim or ""))]
+        for i in compounds:
+            used[i] = True
 
     pool = [i for i in range(n) if not used[i]]
-
-    clusters: List[List[int]] = []
+    clusters = []
     visited = set()
     for i in pool:
         if i in visited:
@@ -997,197 +815,198 @@ def dedupe_and_arbitrate(items: List[NormalizedLineItem]) -> List[NormalizedLine
         for j in pool:
             if j in visited:
                 continue
-            try:
-                if _similar_actions(fixed[i], fixed[j]):
-                    g.append(j)
-                    visited.add(j)
-            except Exception as e:
-                print(f"Error comparing items {i} and {j}: {e}")
-                continue
+            if _similar_actions(fixed[i], fixed[j]):
+                g.append(j)
+                visited.add(j)
         clusters.append(g)
 
     result: List[NormalizedLineItem] = []
     for g in clusters:
-        try:
-            if len(g) == 1:
-                result.append(fixed[g[0]])
-                continue
-
-            context_parts = []
-            for k in g:
-                text = fixed[k].verbatim or fixed[k].item or ""
-                safe_text = str(text).encode('ascii', 'ignore').decode('ascii') if text else ""
-                context_parts.append(safe_text)
-            context = " ".join(context_parts)
-
-            winner = fixed[g[0]]
-            sev_rank = {"high": 3, "medium": 2, "low": 1}
-            best = sev_rank.get((winner.severity or "").lower(), 0)
-            exps = [winner.explanation] if winner.explanation else []
-
-            for k in g[1:]:
-                try:
-                    candidate = fixed[k]
-                    winner = _pick_preferred(winner, candidate, context)
-                    s = sev_rank.get((candidate.severity or "").lower(), 0)
-                    if s > best:
-                        winner.severity = candidate.severity
-                        best = s
-                    if (candidate.location or "") and len(candidate.location or "") > len(winner.location or ""):
-                        winner.location = candidate.location
-                    if candidate.explanation and candidate.explanation not in exps:
-                        exps.append(candidate.explanation)
-                except Exception as e:
-                    print(f"Error merging attributes for item {k}: {e}")
-                    continue
-
-            if exps:
-                try:
-                    winner.explanation = " | ".join([e for e in exps if e])
-                except Exception as e:
-                    print(f"Error joining explanations: {e}")
-                    winner.explanation = exps[0] if exps else None
-
+        if len(g) == 1:
+            result.append(fixed[g[0]])
+        else:
+            winner = max([fixed[k] for k in g], key=lambda x: len(x.item or ""))
             result.append(winner)
-        except Exception as e:
-            print(f"Error processing cluster: {e}")
-            if g:
-                result.append(fixed[g[0]])
-            continue
-
-    print("DEBUG[dedupe_and_arbitrate]: finished with", len(result), "items")
     return result
 
-# ---------- Merge heuristics ----------
-def _merge_with_heuristics(full_text: str, normalized: List[NormalizedLineItem]) -> Tuple[List[NormalizedLineItem], int]:
-    print("DEBUG[_merge_with_heuristics]: starting with", len(normalized), "normalized items")
-    heur_items = []
-    for m in NUMBERED_OR_BULLET.finditer(full_text):
-        line = (m.group(1) or "").strip()
-        if len(line) < 6:
-            continue
-        if META_INSTRUCTION_PATTERN.search(line):
-            continue
-        if SUMMARY_PATTERN.search(line):
-            continue
-        if re.search(r'\b(report|inspection|recommendations?|items?)\b', line, re.I) and not REPAIR_HINT.search(line):
-            continue
-        if REPAIR_HINT.search(line):
-            heur_items.append(NormalizedLineItem(category="Minor Handyman Repairs", item=line, verbatim=line))
-
-    added = 0
-    for h in heur_items:
-        dup = False
-        for ex in normalized:
-            if _similar_actions(h, ex):
-                dup = True
-                break
-        if not dup:
-            normalized.append(h)
-            added += 1
-
-    print("DEBUG[_merge_with_heuristics]: added", added, "heuristic items; total now", len(normalized))
-    return normalized, added
-
-# ---------------- Explanations backstop ----------------
 def ensure_explanations(items: List[NormalizedLineItem]) -> List[NormalizedLineItem]:
-    print("DEBUG[ensure_explanations]: ensuring explanations for", len(items), "items")
     for it in items:
         if not it.explanation or not str(it.explanation).strip():
-            it.explanation = DEFAULT_EXPLANATION_BY_CATEGORY.get(
-                it.category,
-                "Assigned based on required trade skills and safety/codes."
-            )
+            it.explanation = DEFAULT_EXPLANATION_BY_CATEGORY.get(it.category, "Assigned based on required trade skills and safety/codes.")
     return items
 
 # ---------------- Core extraction flow ----------------
-def extract_repairs_comprehensive(text: str, address: str = "") -> Tuple[List[NormalizedLineItem], List[IgnoredExample], Dict]:
-    print("DEBUG[extract_repairs_comprehensive]: starting, chars=", len(text))
+def extract_repairs_comprehensive(text: str, address: str = "", doc_type: str = "inspection_report") -> Tuple[List[NormalizedLineItem], List[IgnoredExample], Dict]:
     estimated_tokens = len(text) // 4
-    system_tokens = len(SYSTEM_PROMPT) // 4 + 200
+    system_prompt = _active_system_prompt(doc_type)
+    system_tokens = len(system_prompt) // 4 + 200
 
     def _normalize_from_result(result_obj: dict) -> Tuple[List[NormalizedLineItem], List[IgnoredExample]]:
-        print("DEBUG[_normalize_from_result]: raw keys:", list(result_obj.keys()))
         items: List[NormalizedLineItem] = []
         ignored: List[IgnoredExample] = []
-        its = result_obj.get("items", [])
+        its = result_obj.get("items", []) if isinstance(result_obj, dict) else []
         if isinstance(its, list):
             for it in its:
-                item_text = (it.get("item") or "").strip() if isinstance(it, dict) else ""
+                if not isinstance(it, dict):
+                    continue
+                item_text = (it.get("item") or "").strip()
                 if not item_text:
+                    continue
+                if _looks_like_section_header(item_text):
                     continue
                 items.append(NormalizedLineItem(
                     category=it.get("category") or "Minor Handyman Repairs",
                     item=item_text,
-                    verbatim=it.get("verbatim") or item_text,
+                    verbatim=(it.get("verbatim") or item_text),
                     location=it.get("location"),
-                    qty=it.get("qty"),
+                    qty=_num(it.get("qty")),
                     units=it.get("units"),
-                    severity=it.get("severity"),
-                    explanation=it.get("explanation")
+                    severity=(it.get("severity") or "medium"),
+                    explanation=it.get("explanation"),
                 ))
-        ign = result_obj.get("ignored_examples", [])
+        ign = result_obj.get("ignored_examples", []) if isinstance(result_obj, dict) else []
         if isinstance(ign, list):
             for g in ign:
-                v = (g.get("verbatim") or "").strip() if isinstance(g, dict) else ""
+                if not isinstance(g, dict):
+                    continue
+                v = (g.get("verbatim") or "").strip()
                 if v:
                     ignored.append(IgnoredExample(verbatim=v, why=g.get("why")))
-        print("DEBUG[_normalize_from_result]: normalized items:", len(items), "ignored:", len(ignored))
         return items, ignored
 
-    # Single-shot path
-    if estimated_tokens + system_tokens <= MAX_TOKENS - RESPONSE_MAX_TOKENS:
-        print("DEBUG[extract_repairs_comprehensive]: using single_request path")
-        result = call_ai_extraction(text, address)
+    if estimated_tokens + system_tokens <= CLAUDE_MAX_TOKENS - CLAUDE_RESPONSE_MAX_TOKENS:
+        result = call_claude_extraction(text, address, doc_type=doc_type)
         norm_items, ignored = _normalize_from_result(result)
         norm_items = dedupe_and_arbitrate(norm_items)
-        merged_items, added_count = _merge_with_heuristics(text, norm_items)
-        merged_items = dedupe_and_arbitrate(merged_items)
-        merged_items = ensure_explanations(merged_items)
+        norm_items = ensure_explanations(norm_items)
         meta = {
             "mode": "single_request",
             "estimated_tokens": estimated_tokens,
-            "items_from_llm": len(merged_items),
-            "total_items_found": result.get("total_items_found"),
-            "extracted_address": result.get("property_address"),
-            "error": result.get("error"),
-            "merged_heuristics_added": added_count,
-            "model": MODEL_NAME,
-            "ai_provider": AI_PROVIDER,
+            "items_from_llm": len(norm_items),
+            "total_items_found": (result.get("total_items_found") if isinstance(result, dict) else None),
+            "extracted_address": (result.get("property_address") if isinstance(result, dict) else None),
+            "error": (result.get("error") if isinstance(result, dict) else None),
+            "model": CLAUDE_MODEL,
+            "ai_provider": "claude",
         }
-        print("DEBUG[extract_repairs_comprehensive]: single_request meta:", meta)
-        return merged_items, ignored, meta
+        return norm_items, ignored, meta
 
-    # Chunked path
-    print("DEBUG[extract_repairs_comprehensive]: using multi_chunk path")
-    chunks = chunk_text_by_tokens(text, MAX_TOKENS - system_tokens - RESPONSE_MAX_TOKENS)
+    chunks = chunk_text_by_tokens(text, CLAUDE_MAX_TOKENS - system_tokens - CLAUDE_RESPONSE_MAX_TOKENS)
     all_norm: List[NormalizedLineItem] = []
     all_ignored: List[IgnoredExample] = []
-
     for i, chunk in enumerate(chunks):
-        print(f"DEBUG[extract_repairs_comprehensive]: chunk {i+1}/{len(chunks)}, chars={len(chunk)}")
-        result = call_ai_extraction(chunk, address)
+        print(f"DEBUG[extract_repairs_comprehensive]: chunk {i+1}/{len(chunks)} chars={len(chunk)}")
+        result = call_claude_extraction(chunk, address, doc_type=doc_type)
         n, ig = _normalize_from_result(result)
         all_norm.extend(n)
         all_ignored.extend(ig)
 
     deduped = dedupe_and_arbitrate(all_norm)
-    merged_items, added_count = _merge_with_heuristics(text, deduped)
-    merged_items = dedupe_and_arbitrate(merged_items)
-    merged_items = ensure_explanations(merged_items)
-
+    deduped = ensure_explanations(deduped)
     meta = {
         "mode": "multi_chunk",
         "chunks": len(chunks),
         "estimated_tokens": estimated_tokens,
         "items_from_llm": len(deduped),
-        "merged_heuristics_added": added_count,
         "total_raw_items": len(all_norm),
-        "model": MODEL_NAME,
-        "ai_provider": AI_PROVIDER,
+        "model": CLAUDE_MODEL,
+        "ai_provider": "claude",
     }
-    print("DEBUG[extract_repairs_comprehensive]: multi_chunk meta:", meta)
-    return merged_items, all_ignored, meta
+    return deduped, all_ignored, meta
+
+# ---------------- Provider search helpers ----------------
+def provider_score(rating: float, reviews: int, prior_mean: float = 4.3, prior_weight: int = 20) -> float:
+    if rating <= 0 or reviews < 0:
+        return 0.0
+    return (rating * reviews + prior_mean * prior_weight) / (reviews + prior_weight)
+
+def geocode_address(address: str):
+    if not GOOGLE_MAPS_API_KEY or not address:
+        return None
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+            timeout=5,
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        loc = data["results"][0]["geometry"]["location"]
+        return (loc["lat"], loc["lng"])
+    except Exception:
+        return None
+
+def _places_nearby(lat: float, lng: float, keyword: str, radius_m: int) -> list:
+    if not GOOGLE_MAPS_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params={"key": GOOGLE_MAPS_API_KEY, "location": f"{lat},{lng}", "radius": radius_m, "keyword": keyword},
+            timeout=5,
+        )
+        data = resp.json()
+        return data.get("results", []) or []
+    except Exception:
+        return []
+
+def _place_details(place_id: str) -> dict:
+    if not GOOGLE_MAPS_API_KEY or not place_id:
+        return {}
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={"key": GOOGLE_MAPS_API_KEY, "place_id": place_id, "fields": "formatted_phone_number,website,formatted_address"},
+            timeout=5,
+        )
+        data = resp.json()
+        return data.get("result", {}) or {}
+    except Exception:
+        return {}
+
+def find_providers_for_category(category: str, lat: float, lng: float) -> list:
+    labels = CATEGORY_PROVIDER_MAP.get(category, {}).get("providers") or [category]
+    keyword = " ".join(labels)
+    radii_miles = [10, 20, 40]
+    radii = [int(r * 1609.34) for r in radii_miles]
+    seen = set()
+    candidates = []
+
+    for r_m in radii:
+        results = _places_nearby(lat, lng, keyword, r_m)
+        for r in results:
+            pid = r.get("place_id")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            rating = float(r.get("rating", 0.0))
+            reviews = int(r.get("user_ratings_total", 0))
+            if rating < 4.0 or reviews < 5:
+                continue
+            score = provider_score(rating, reviews)
+            candidates.append({
+                "place_id": pid,
+                "name": r.get("name"),
+                "rating": rating,
+                "review_count": reviews,
+                "address": r.get("vicinity"),
+                "score": score,
+            })
+        if len(candidates) >= 15:
+            break
+
+    candidates.sort(key=lambda x: (x["score"], x["review_count"]), reverse=True)
+    top = candidates[:3]
+    enriched = []
+    for p in top:
+        details = _place_details(p["place_id"])
+        if details:
+            p["phone"] = details.get("formatted_phone_number")
+            p["website"] = details.get("website")
+            p["address"] = details.get("formatted_address") or p.get("address")
+        enriched.append(p)
+    return enriched
 
 # ---------------- Routes ----------------
 @app.get("/", response_class=HTMLResponse)
@@ -1198,159 +1017,163 @@ def index(request: Request):
 async def upload(
     file: UploadFile = File(...),
     address: str = Form(default=""),
-    notes: str = Form(default="")
+    notes: str = Form(default=""),
 ):
     print("\n=== DEBUG[/upload]: new request ===")
     print("DEBUG[/upload]: incoming filename:", file.filename)
-    print("DEBUG[/upload]: address (form):", repr(address))
-    print("DEBUG[/upload]: notes length:", len(notes or ""))
 
     data = await file.read()
     name = (file.filename or "").lower()
 
-    # --- Text extraction ---
+    text = ""
+    first_pages_text = ""
+    num_pages = 1
+
     if name.endswith(".pdf"):
-        print("DEBUG[/upload]: detected PDF")
-        text = extract_pages_text_from_pdf(data)
+        text, num_pages, first_pages_text = extract_pages_text_from_pdf(data)
     elif name.endswith(".txt"):
-        print("DEBUG[/upload]: detected TXT")
         text = data.decode("utf-8", errors="ignore")
+        first_pages_text = text[:6000]
+        num_pages = 1
     elif name.endswith((".png", ".jpg", ".jpeg")):
-        print("DEBUG[/upload]: detected image")
         text = extract_text_from_image(data)
+        first_pages_text = text[:6000]
+        num_pages = 1
     else:
-        print("DEBUG[/upload]: unsupported file type:", name)
         raise HTTPException(status_code=400, detail="Supported: .pdf, .txt, .png, .jpg, .jpeg")
 
     if not text or len(text.strip()) < 20:
-        print("DEBUG[/upload]: extracted text too short, len=", len(text or ""))
         raise HTTPException(status_code=422, detail="No meaningful text could be extracted from the file.")
 
-    print("DEBUG[/upload]: extracted text length:", len(text))
+    print("DEBUG[/upload]: extracted chars:", len(text), "pages:", num_pages)
 
-    normalized_items: List[NormalizedLineItem] = []
-    ignored_examples: List[IgnoredExample] = []
-    items_for_display: List[LineItem] = []
+    # --- OPEN-SET LLM GATE ---
+    snippets = _sample_snippets(text, n=3, snippet_chars=900)
+    gate = classify_document_llm(page_count=num_pages, first_pages_text=first_pages_text, snippets=snippets)
+
+    doc_type = gate.get("doc_type", "unknown")
+    doc_label = gate.get("doc_label", "Unknown")
+    doc_conf = gate.get("confidence", "low")
+    in_domain = bool(gate.get("in_domain", False))
+    doc_reason = gate.get("reason", "")
 
     meta: Dict = {
         "llm_used": False,
         "extraction_method": "none",
         "text_length": len(text),
-        "model": MODEL_NAME,
-        "ai_provider": AI_PROVIDER,
+        "page_count": num_pages,
+        "model": CLAUDE_MODEL,
+        "ai_provider": "claude",
+        "doc_type": doc_type,
+        "doc_type_label": doc_label,
+        "doc_type_confidence": doc_conf,
+        "doc_type_reason": doc_reason,
+        "in_domain": in_domain,
+        "pricing_used": False,
+        "pricing_attempted": False,
+        "pricing_items_in": 0,
+        "pricing_items_priced": 0,
+        "pricing_totals": {"low": 0.0, "high": 0.0, "currency": "USD"},
+        "providers": {},
     }
 
-    # Extraction
-    if API_KEY and ((AI_PROVIDER.lower() == "claude" and _anthropic_client) or (AI_PROVIDER.lower() == "openai" and _openai_client)):
-        print("DEBUG[/upload]: API_KEY present and client initialized; running comprehensive extraction")
+    # Refuse if out-of-domain or too-uncertain
+    if (not in_domain) or (doc_type == "unknown" and doc_conf == "low"):
+        meta["user_message"] = "Unable to complete analysis. This document does not appear to be an inspection report or repair proposal. Did you upload the right document?"
+        return ParsedResponse(address=address or None, notes=notes or None, items=[], normalized_items=[], ignored_examples=[], meta=meta)
+
+    if doc_type == "unknown":
+        meta["user_message"] = "Unable to confidently determine document type. Please upload the inspection report or repair proposal."
+        return ParsedResponse(address=address or None, notes=notes or None, items=[], normalized_items=[], ignored_examples=[], meta=meta)
+
+    # --- Extraction ---
+    normalized_items: List[NormalizedLineItem] = []
+    ignored_examples: List[IgnoredExample] = []
+    items_for_display: List[LineItem] = []
+
+    if ANTHROPIC_API_KEY and _anthropic_client:
+        meta["llm_used"] = True
+        meta["extraction_method"] = f"claude_comprehensive_{doc_type}"
         try:
-            normalized_items, ignored_examples, extraction_meta = extract_repairs_comprehensive(text, address)
-            print("\n=== DEBUG[/upload]: First 3 extracted items ===")
-            for i, item in enumerate(normalized_items[:3]):
-                print(f"{i+1}. Item: {item.item}")
-                print(f"   Category: {item.category}")
-                print(f"   Explanation: {item.explanation}")
-                print("---")
-            meta.update({
-                "llm_used": True,
-                "extraction_method": f"{AI_PROVIDER.lower()}_comprehensive",
-                **extraction_meta,
-            })
+            normalized_items, ignored_examples, extraction_meta = extract_repairs_comprehensive(text, address, doc_type=doc_type)
+            meta.update(extraction_meta)
         except Exception as e:
-            print("DEBUG[/upload]: extraction error:", e)
             meta["llm_error"] = str(e)
-            meta["extraction_method"] = f"{AI_PROVIDER.lower()}_failed"
-    else:
-        print("DEBUG[/upload]: LLM not configured; skipping comprehensive extraction")
+            meta["extraction_method"] = f"claude_failed_{doc_type}"
 
     if not normalized_items:
-        print("DEBUG[/upload]: no normalized_items from LLM, falling back to regex parser")
         fallback = simple_fallback_parse(text)
         normalized_items = [
-            NormalizedLineItem(category=i.category, item=i.item_text, verbatim=i.item_text)
+            NormalizedLineItem(category=i.category, item=i.item_text, verbatim=i.item_text, severity="medium")
             for i in fallback
         ]
         normalized_items = ensure_explanations(normalized_items)
-        meta["extraction_method"] = "fallback_regex"
+        meta["extraction_method"] = f"fallback_regex_{doc_type}"
 
-    print("DEBUG[/upload]: normalized_items count after extraction/fallback:", len(normalized_items))
+    # final cleanup + dedupe
+    normalized_items = [it for it in normalized_items if it.item and not _looks_like_section_header(it.item)]
+    normalized_items = dedupe_and_arbitrate(normalized_items)
+    normalized_items = ensure_explanations(normalized_items)
 
-    # --- Pricing step (Claude-only for now) ---
-    pricing_totals = {"low": 0.0, "high": 0.0, "currency": "USD"}
-    meta["pricing_used"] = False
+    # ✅ NEW: stable sort before pricing (this is what you asked for)
+    normalized_items = sort_items_stably(normalized_items)
+    meta["stable_sort_before_pricing"] = True
 
-    if normalized_items and AI_PROVIDER.lower() == "claude" and _anthropic_client:
-        print("DEBUG[/upload]: running pricing for items")
+    # --- Pricing (coverage-guaranteed) ---
+    meta["pricing_attempted"] = False
+    meta["pricing_items_in"] = len(normalized_items)
+    meta["pricing_items_priced"] = 0
+
+    if normalized_items and ANTHROPIC_API_KEY and _anthropic_client:
+        meta["pricing_attempted"] = True
         try:
-            pricing_map = call_ai_pricing(normalized_items, address)
-            print(f"=== DEBUG[/upload]: Pricing map size: {len(pricing_map)} ===")
+            pricing_map = call_claude_pricing(normalized_items, address, batch_size=15, max_passes=2)
 
-            # Attach prices
+            priced_count = 0
             for idx, it in enumerate(normalized_items):
                 if idx in pricing_map:
                     it.price = pricing_map[idx]
+                    priced_count += 1
+            meta["pricing_items_priced"] = priced_count
+            meta["pricing_map_size"] = len(pricing_map)
 
-            # Drop all items the pricing agent says are $0–$0
-            filtered_items = []
+            # your rule: drop 0–0 priced items
+            filtered = []
             for it in normalized_items:
                 if it.price and it.price.low == 0 and it.price.high == 0:
-                    print(f"DEBUG[/upload]: Dropping zero-priced item: {it.item}")
                     continue
-                filtered_items.append(it)
-            normalized_items = filtered_items
+                filtered.append(it)
+            normalized_items = filtered
 
-            # Recompute totals only from non-zero items
+            totals = {"low": 0.0, "high": 0.0, "currency": "USD"}
             for it in normalized_items:
                 if it.price:
-                    pricing_totals["low"] += it.price.low
-                    pricing_totals["high"] += it.price.high
-                    pricing_totals["currency"] = it.price.currency or "USD"
-
-            if pricing_totals["low"] > 0 or pricing_totals["high"] > 0:
-                meta["pricing_totals"] = pricing_totals
-                meta["pricing_used"] = True
-            print("DEBUG[/upload]: pricing_totals:", pricing_totals)
+                    totals["low"] += float(it.price.low)
+                    totals["high"] += float(it.price.high)
+                    totals["currency"] = it.price.currency or "USD"
+            meta["pricing_totals"] = totals
+            meta["pricing_used"] = (totals["low"] > 0 or totals["high"] > 0)
         except Exception as e:
-            print("DEBUG[/upload]: pricing error:", e)
             meta["pricing_error"] = str(e)
 
-    # --- Provider search (Google Places) ---
+    # --- Provider search ---
     providers_by_category: Dict[str, List[Dict]] = {}
-
-    print("DEBUG[/upload]: starting provider lookup")
-    print("DEBUG[/upload]: GOOGLE_MAPS_API_KEY present:", bool(GOOGLE_MAPS_API_KEY))
-    print("DEBUG[/upload]: address from form:", repr(address))
-    print("DEBUG[/upload]: normalized_items count:", len(normalized_items))
-
     if GOOGLE_MAPS_API_KEY and address and normalized_items:
         coords = geocode_address(address)
-        print("DEBUG[/upload]: geocode_address returned coords:", coords)
         if coords:
             lat, lng = coords
             used_categories = sorted({it.category for it in normalized_items})
-            print("DEBUG[/upload]: unique categories to search providers for:", used_categories)
-
             for cat in used_categories:
                 try:
-                    providers = find_providers_for_category(cat, lat, lng)
-                    providers_by_category[cat] = providers
-                    print(f"DEBUG[/upload]: category={cat!r}, providers_found={len(providers)}")
+                    providers_by_category[cat] = find_providers_for_category(cat, lat, lng)
                 except Exception as e:
                     print(f"DEBUG[/upload]: Provider search error for {cat}: {e}")
-        else:
-            print("DEBUG[/upload]: coords is None, skipping provider search")
-    else:
-        print("DEBUG[/upload]: skipping provider search due to missing key/address/items")
-
     meta["providers"] = providers_by_category
-    print("DEBUG[/upload]: final providers_by_category keys:", list(providers_by_category.keys()))
 
-    # Build display items
+    # --- Build display items ---
     for it in normalized_items:
         if not it.explanation:
-            it.explanation = DEFAULT_EXPLANATION_BY_CATEGORY.get(
-                it.category, "Assigned based on required trade skills and safety/codes."
-            )
+            it.explanation = DEFAULT_EXPLANATION_BY_CATEGORY.get(it.category, "Assigned based on required trade skills and safety/codes.")
 
         reason_note = f"Reason: {it.explanation}"
 
@@ -1377,17 +1200,15 @@ async def upload(
             currency=it.price.currency if it.price else None,
         ))
 
-    print("DEBUG[/upload]: items_for_display count:", len(items_for_display))
-    print("DEBUG[/upload]: returning ParsedResponse")
-
     return ParsedResponse(
         address=address or None,
         notes=notes or None,
         items=items_for_display,
         normalized_items=normalized_items,
         ignored_examples=ignored_examples,
-        meta=meta
+        meta=meta,
     )
 
 # Run: uvicorn app:app --reload
+
 

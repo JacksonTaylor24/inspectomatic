@@ -1,5 +1,8 @@
-// static/script.js — pricing, clean reasons, locations, Google address autocomplete, providers, html2pdf
-// static/script.js — pricing, clean reasons, locations, Google address autocomplete, providers, html2pdf
+// web/static/script.js — FULL DROP-IN REPLACEMENT
+// Fixes:
+// 1) removes "Report Type:" label and moves doc label under "Generated" with same font
+// 4) prevents item blocks from splitting across pages in PDF export (css + html2pdf pagebreak)
+// Minor: removes "Report type:" in status messages, keeps clean doc label
 (function () {
   "use strict";
 
@@ -29,7 +32,7 @@
   ];
   const SEV_SCORE = { high: 3, medium: 2, low: 1 };
 
-  console.log("DEBUG: script.js is loading (clean reasons + locations + Google autocomplete + providers)...");
+  console.log("DEBUG: script.js is loading (clean doc label + improved PDF page breaks)...");
 
   const steps = Array.from(document.querySelectorAll(".step"));
   const panes = {
@@ -69,6 +72,8 @@
   let lastResult = null;
   let lastNotes = "";
   let lastAddress = "";
+  let lastDocTypeLabel = "";
+  let lastDocType = "";
 
   function go(step) {
     Object.values(panes).forEach((p) => p.classList.add("hidden"));
@@ -85,9 +90,7 @@
   function setFile(f) {
     selectedFile = f || null;
     if (selectedFile) {
-      badge(
-        `${selectedFile.name} • ${(selectedFile.size / 1024).toFixed(1)} KB`
-      );
+      badge(`${selectedFile.name} • ${(selectedFile.size / 1024).toFixed(1)} KB`);
       nextFrom1.disabled = false;
     } else {
       badge("");
@@ -148,9 +151,7 @@
     let t = String(text);
 
     const pipeIdx = t.indexOf("|");
-    if (pipeIdx !== -1) {
-      t = t.slice(0, pipeIdx);
-    }
+    if (pipeIdx !== -1) t = t.slice(0, pipeIdx);
 
     t = t.replace(/Estimated cost range:.*$/i, "");
     t = t.replace(/^\s*Reason[:\-]\s*/i, "");
@@ -162,6 +163,14 @@
   // Step 2 next
   nextFrom2?.addEventListener("click", () => go(3));
 
+  function setLoading(docLabelMaybe) {
+    reportDisplay.classList.add("hidden");
+    loadingDisplay.style.display = "block";
+    loadingText.textContent = "Analyzing your document...";
+    statusEl.textContent = docLabelMaybe ? `Processing with AI… • ${docLabelMaybe}` : "Processing document with AI…";
+    downloadPdfBtn.disabled = true;
+  }
+
   // Submit
   submitBtn?.addEventListener("click", async () => {
     console.log("DEBUG: Submit button clicked");
@@ -172,11 +181,7 @@
       return;
     }
 
-    reportDisplay.classList.add("hidden");
-    loadingDisplay.style.display = "block";
-    loadingText.textContent = "Analyzing your inspection report...";
-    statusEl.textContent = "Processing document with AI...";
-    downloadPdfBtn.disabled = true;
+    setLoading("");
 
     lastNotes = (notesEl?.value || "").trim();
     lastAddress = (addressInput?.value || "").trim();
@@ -199,19 +204,29 @@
       const data = await res.json();
       lastResult = data;
 
+      lastDocType = data?.meta?.doc_type || "";
+      lastDocTypeLabel = data?.meta?.doc_type_label || "";
+
       console.log("=== DEBUG: FULL API RESPONSE (truncated) ===");
       console.log(JSON.stringify(data, null, 2).slice(0, 4000));
-      console.log("=== DEBUG: meta.providers from backend ===");
-      console.log(data?.meta?.providers);
+      console.log("=== DEBUG: pricing meta ===");
+      console.log({
+        pricing_attempted: data?.meta?.pricing_attempted,
+        pricing_used: data?.meta?.pricing_used,
+        pricing_items_in: data?.meta?.pricing_items_in,
+        pricing_items_priced: data?.meta?.pricing_items_priced,
+        pricing_error: data?.meta?.pricing_error,
+        pricing_totals: data?.meta?.pricing_totals
+      });
 
-      statusEl.textContent = "Generating beautiful report...";
+      statusEl.textContent = lastDocTypeLabel ? `Generating beautiful report… • ${lastDocTypeLabel}` : "Generating beautiful report...";
 
       buildAndDisplayReport(lastResult, lastAddress, lastNotes);
 
       downloadPdfBtn.disabled = false;
       downloadPdfBtn.onclick = () => exportToPDF();
 
-      statusEl.textContent = "Analysis complete ✓";
+      statusEl.textContent = lastDocTypeLabel ? `Analysis complete ✓ • ${lastDocTypeLabel}` : "Analysis complete ✓";
     } catch (e) {
       console.error("DEBUG: Error in submit:", e);
       loadingText.textContent = "Error: " + e.message;
@@ -225,16 +240,14 @@
 
     let items = [];
     const pricingTotals = data?.meta?.pricing_totals || null;
-    const normalized = Array.isArray(data?.normalized_items)
-      ? data.normalized_items
-      : null;
+    const normalized = Array.isArray(data?.normalized_items) ? data.normalized_items : null;
     const providersByCategory = data?.meta?.providers || {};
 
-    console.log("DEBUG: providersByCategory in buildAndDisplayReport:", providersByCategory);
+    const docTypeLabel = data?.meta?.doc_type_label || lastDocTypeLabel || "";
 
-    // Prefer items array (has cost_low / cost_high), but pull location/explanation from normalized when available
+    // Prefer items array (has cost_low / cost_high), but pull location from normalized when available
     if (Array.isArray(data?.items) && data.items.length > 0) {
-      console.log("DEBUG: Using items array (with normalized_items for locations). Length:", data.items.length);
+      console.log("DEBUG: Using items array. Length:", data.items.length);
       items = data.items.map((it, idx) => {
         const norm = normalized && normalized[idx] ? normalized[idx] : null;
         return {
@@ -245,20 +258,13 @@
           qty: it.qty,
           units: norm && norm.units ? norm.units : null,
           severity: it.priority || (norm && norm.severity) || "medium",
-          explanation: cleanExplanation(
-            it.notes || (norm && norm.explanation) || ""
-          ),
-          price_low:
-            typeof it.cost_low === "number" ? it.cost_low : null,
-          price_high:
-            typeof it.cost_high === "number" ? it.cost_high : null,
+          explanation: cleanExplanation(it.notes || (norm && norm.explanation) || ""),
+          price_low: typeof it.cost_low === "number" ? it.cost_low : null,
+          price_high: typeof it.cost_high === "number" ? it.cost_high : null,
           currency: it.currency || (pricingTotals?.currency || "USD")
         };
       });
-    } else if (
-      Array.isArray(data?.normalized_items) &&
-      data.normalized_items.length > 0
-    ) {
+    } else if (Array.isArray(data?.normalized_items) && data.normalized_items.length > 0) {
       console.log("DEBUG: Using normalized_items array only. Length:", data.normalized_items.length);
       items = data.normalized_items.map((it) => ({
         category: it.category || "Minor Handyman Repairs",
@@ -269,18 +275,9 @@
         units: it.units,
         severity: it.severity || "medium",
         explanation: cleanExplanation(it.explanation),
-        price_low:
-          it.price && typeof it.price.low === "number"
-            ? it.price.low
-            : null,
-        price_high:
-          it.price && typeof it.price.high === "number"
-            ? it.price.high
-            : null,
-        currency:
-          it.price && it.price.currency
-            ? it.price.currency
-            : (pricingTotals?.currency || "USD")
+        price_low: it.price && typeof it.price.low === "number" ? it.price.low : null,
+        price_high: it.price && typeof it.price.high === "number" ? it.price.high : null,
+        currency: it.price && it.price.currency ? it.price.currency : (pricingTotals?.currency || "USD")
       }));
     }
 
@@ -315,15 +312,14 @@
       byCat.get(it.category).push(it);
     });
 
-    console.log("DEBUG: Categories in report:", Array.from(byCat.keys()));
-
     const reportHtml = buildReportHTML(
       byCat,
       address,
       notes,
       items.length,
       pricingTotals,
-      providersByCategory
+      providersByCategory,
+      docTypeLabel
     );
 
     reportDisplay.innerHTML = reportHtml;
@@ -331,7 +327,7 @@
     reportDisplay.classList.remove("hidden");
   }
 
-  function buildReportHTML(byCat, address, notes, totalItems, pricingTotals, providersByCategory) {
+  function buildReportHTML(byCat, address, notes, totalItems, pricingTotals, providersByCategory, docTypeLabel) {
     const currentDate = new Date().toLocaleDateString("en-US", {
       year: "numeric",
       month: "long",
@@ -344,9 +340,8 @@
     });
 
     const totalRangeHtml =
-      pricingTotals &&
-      typeof pricingTotals.low === "number" &&
-      typeof pricingTotals.high === "number"
+      pricingTotals && typeof pricingTotals.low === "number" && typeof pricingTotals.high === "number" &&
+      (pricingTotals.low > 0 || pricingTotals.high > 0)
         ? `
         <div style="margin: 16px 0 24px; display: flex; justify-content: center;">
           <div style="display: inline-flex; flex-direction: column; align-items: center; padding: 12px 20px; border-radius: 999px; border: 1px solid #000; background: #f9fafb; gap: 4px;">
@@ -358,6 +353,11 @@
         </div>
       `
         : "";
+
+    // Doc label should appear under "Generated" in SAME font (report-meta).
+    const docLabelMetaHtml = docTypeLabel
+      ? `<div>${escapeHtml(docTypeLabel)}</div>`
+      : "";
 
     let html = `
       <div class="report-container">
@@ -372,7 +372,7 @@
           <p style="margin: 0; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">HOME BUYING RESOURCE TO SIMPLIFY</p>
           <p style="margin: 0; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">THE INSPECTION PROCESS</p>
           <div style="margin: 20px 0 8px; height: 1px; background: #000; width: 120px; margin-left: auto; margin-right: auto;"></div>
-          <h3 style="margin: 0; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">PROPERTY INSPECTION REPORT</h3>
+          <h3 style="margin: 0; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">PROPERTY REPORT</h3>
         </div>
 
         <div style="text-align: center; margin-bottom: 8px;">
@@ -381,10 +381,17 @@
           )}</p>
         </div>
 
-        <div class="report-meta">
-          <div>Generated: ${currentDate} at ${currentTime}</div>
-          <div>Total Items: ${totalItems}</div>
+        
+        <div class="report-meta" style="display:flex; justify-content:space-between; align-items:flex-end; gap:16px;">
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div>Generated: ${currentDate} at ${currentTime}</div>
+            ${docTypeLabel ? `<div>Report Type: ${escapeHtml(docTypeLabel)}</div>` : ``}
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
+            <div>Total Items: ${totalItems}</div>
+          </div>
         </div>
+
 
         ${totalRangeHtml}
     `;
@@ -393,9 +400,7 @@
       html += `
         <div style="background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 16px; margin-bottom: 32px;">
           <h4 style="margin: 0 0 8px 0; font-size: 12px; font-weight: 600; color: #000; text-transform: uppercase; letter-spacing: 0.5px;">ADDITIONAL NOTES</h4>
-          <p style="margin: 0; font-size: 14px; color: #666; line-height: 1.5;">${escapeHtml(
-            notes
-          )}</p>
+          <p style="margin: 0; font-size: 14px; color: #666; line-height: 1.5;">${escapeHtml(notes)}</p>
         </div>
       `;
     }
@@ -404,36 +409,29 @@
       if (!arr || !arr.length) return;
 
       const providers = providersByCategory[category] || [];
-      console.log(`DEBUG: Providers for category "${category}":`, providers);
 
       html += `
         <div class="report-section" style="margin-bottom: 40px;">
-          <h3 style="background: #000; color: white; padding: 12px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; margin: 0 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(
-            category
-          )}</h3>
+          <h3 style="background: #000; color: white; padding: 12px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; margin: 0 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(category)}</h3>
           <div style="border: 1px solid #e9ecef; border-top: none; border-radius: 0 0 4px 4px; background: #fff;">
       `;
 
       arr.forEach((item, index) => {
         const severityText =
           item.severity && item.severity.length
-            ? item.severity.charAt(0).toUpperCase() +
-              item.severity.slice(1)
+            ? item.severity.charAt(0).toUpperCase() + item.severity.slice(1)
             : "Medium";
-        const hasPrice =
-          typeof item.price_low === "number" &&
-          typeof item.price_high === "number";
+        const hasPrice = typeof item.price_low === "number" && typeof item.price_high === "number";
 
+        // KEY: prevent page breaks inside each item block
         html += `
-          <div style="padding: 20px; border-bottom: 1px solid #f1f3f4;">
+          <div class="no-break" style="padding: 20px; border-bottom: 1px solid #f1f3f4; break-inside: avoid; page-break-inside: avoid;">
             <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px;">
               <div style="width: 24px; height: 24px; border: 1px solid #000; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
                 <span style="font-size: 12px; font-weight: 600;">${index + 1}</span>
               </div>
               <div style="flex: 1;">
-                <h4 style="margin: 0 0 8px 0; font-size: 15px; font-weight: 600; color: #000;">${escapeHtml(
-                  item.item
-                )}</h4>
+                <h4 style="margin: 0 0 8px 0; font-size: 15px; font-weight: 600; color: #000;">${escapeHtml(item.item)}</h4>
                 <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 8px;">
                   <span style="padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; ${getSeverityStyles(
                     item.severity
@@ -441,15 +439,11 @@
         `;
 
         if (item.location) {
-          html += `<span style="font-size: 12px; color: #666;">📍 ${escapeHtml(
-            item.location
-          )}</span>`;
+          html += `<span style="font-size: 12px; color: #666;">📍 ${escapeHtml(item.location)}</span>`;
         }
 
         if (item.qty) {
-          html += `<span style="font-size: 12px; color: #666;">📦 Qty: ${
-            item.qty
-          }${
+          html += `<span style="font-size: 12px; color: #666;">📦 Qty: ${item.qty}${
             item.units ? " " + escapeHtml(item.units) : ""
           }</span>`;
         }
@@ -461,9 +455,7 @@
           )} – ${formatMoney(item.price_high, item.currency)}</span>`;
         }
 
-        html += `
-                </div>
-        `;
+        html += `</div>`;
 
         if (item.explanation) {
           const specialistLabel =
@@ -472,12 +464,8 @@
               : `Why this requires a ${getSpecialistLabel(category)}:`;
           html += `
             <div style="margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 4px; border-left: 3px solid #2563eb;">
-              <strong style="font-size: 13px; color: #000;">${escapeHtml(
-                specialistLabel
-              )}</strong>
-              <span style="font-size: 13px; color: #666; margin-left: 4px;">${escapeHtml(
-                item.explanation
-              )}</span>
+              <strong style="font-size: 13px; color: #000;">${escapeHtml(specialistLabel)}</strong>
+              <span style="font-size: 13px; color: #666; margin-left: 4px;">${escapeHtml(item.explanation)}</span>
             </div>
           `;
         }
@@ -489,9 +477,9 @@
         `;
       });
 
-      // Providers section
+      // Providers section should also avoid splitting
       html += `
-            <div style="padding: 20px; background: #f8f9fa; border-top: 1px solid #e9ecef;">
+            <div class="no-break" style="padding: 20px; background: #f8f9fa; border-top: 1px solid #e9ecef; break-inside: avoid; page-break-inside: avoid;">
               <h4 style="margin: 0 0 12px 0; font-size: 12px; font-weight: 600; color: #000; text-transform: uppercase; letter-spacing: 0.5px;">RECOMMENDED PROVIDERS</h4>
               <div style="display: flex; flex-direction: column; gap: 8px;">
       `;
@@ -515,11 +503,8 @@
             </div>
           `;
         });
-      } else {
-        console.warn(`DEBUG: No providers returned for category "${category}" - showing blanks.`);
       }
 
-      // Fill remaining slots if fewer than 3
       for (let i = providers.length + 1; i <= 3; i++) {
         html += `
           <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">
@@ -537,12 +522,10 @@
     });
 
     html += `
-        <div style="text-align: center; padding: 20px; background: #000; color: white; border-radius: 4px; margin-top: 32px;">
+        <div class="no-break" style="text-align: center; padding: 20px; background: #000; color: white; border-radius: 4px; margin-top: 32px; break-inside: avoid; page-break-inside: avoid;">
           <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${totalItems}</div>
           <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">${
-            totalItems === 1
-              ? "REPAIR ITEM IDENTIFIED"
-              : "REPAIR ITEMS IDENTIFIED"
+            totalItems === 1 ? "REPAIR ITEM IDENTIFIED" : "REPAIR ITEMS IDENTIFIED"
           }</div>
           <div style="font-size: 10px; color: #ccc; margin-top: 8px; font-style: italic;">Generated by Inspectomatic</div>
         </div>
@@ -558,10 +541,7 @@
       medium: "background: #fef3c7; color: #d97706;",
       low: "background: #d1fae5; color: #059669;"
     };
-    return (
-      styles[String(severity || "").toLowerCase()] ||
-      "background: #f3f4f6; color: #374151;"
-    );
+    return styles[String(severity || "").toLowerCase()] || "background: #f3f4f6; color: #374151;";
   }
 
   function formatMoney(value, currency) {
@@ -589,13 +569,27 @@
     downloadPdfBtn.disabled = true;
     downloadPdfBtn.textContent = "Generating PDF...";
 
+    // Inject a tiny print CSS to strengthen page-break control
+    const styleId = "inspectomatic-print-style";
+    if (!document.getElementById(styleId)) {
+      const st = document.createElement("style");
+      st.id = styleId;
+      st.textContent = `
+        .no-break { break-inside: avoid !important; page-break-inside: avoid !important; }
+        .report-section { break-inside: auto; }
+      `;
+      document.head.appendChild(st);
+    }
+
     try {
       const opt = {
         margin: 0.5,
         filename: slug(lastAddress || "inspection-report") + ".pdf",
         image: { type: "jpeg", quality: 0.98 },
         html2canvas: { scale: 2, useCORS: true },
-        jsPDF: { unit: "in", format: "letter", orientation: "portrait" }
+        jsPDF: { unit: "in", format: "letter", orientation: "portrait" },
+        // KEY: let css rules control, and avoid breaking inside .no-break
+        pagebreak: { mode: ["css", "legacy"], avoid: [".no-break"] }
       };
 
       await html2pdf().from(element).set(opt).save();
@@ -680,7 +674,7 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
-    console.log("DEBUG: DOMContentLoaded – starting wizard + Google autocomplete + providers...");
+    console.log("DEBUG: DOMContentLoaded – starting wizard + Google autocomplete...");
     go(1);
     initGoogleAutocomplete();
   });
