@@ -66,6 +66,8 @@
   const loadingDisplay = document.getElementById("loadingDisplay");
   const loadingText = document.getElementById("loadingText");
   const statusEl = document.getElementById("status");
+  const progressBar = document.getElementById("progressBar");
+  const progressPercent = document.getElementById("progressPercent");
   const downloadPdfBtn = document.getElementById("downloadPdfBtn");
 
   let selectedFile = null;
@@ -166,9 +168,125 @@
   function setLoading(docLabelMaybe) {
     reportDisplay.classList.add("hidden");
     loadingDisplay.style.display = "block";
-    loadingText.textContent = "Analyzing your document...";
-    statusEl.textContent = docLabelMaybe ? `Processing with AI… • ${docLabelMaybe}` : "Processing document with AI…";
+    loadingText.textContent = "Inspectomatic is working tirelessly for you...";
+    statusEl.textContent = docLabelMaybe ? `Building your report… • ${docLabelMaybe}` : "Building your report…";
+    if (progressBar) progressBar.style.width = "0%";
+    if (progressPercent) progressPercent.textContent = "0%";
     downloadPdfBtn.disabled = true;
+  }
+
+  function updateProgress(percent, message, stage) {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0));
+    if (progressBar) progressBar.style.width = `${p.toFixed(1)}%`;
+    if (progressPercent) progressPercent.textContent = `${Math.round(p)}%`;
+    loadingText.textContent = "Inspectomatic is working tirelessly for you...";
+    if (message && stage) {
+      statusEl.textContent = `${message} • ${stage}`;
+    } else if (message) {
+      statusEl.textContent = message;
+    } else if (stage) {
+      statusEl.textContent = stage;
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  const LEGACY_UPLOAD_SECONDS_KEY = "inspectomatic_legacy_upload_seconds_ema";
+
+  function getExpectedLegacySeconds() {
+    const v = Number(localStorage.getItem(LEGACY_UPLOAD_SECONDS_KEY));
+    if (!Number.isFinite(v) || v < 10 || v > 300) return 75;
+    return v;
+  }
+
+  function updateExpectedLegacySeconds(actualSeconds) {
+    if (!Number.isFinite(actualSeconds) || actualSeconds < 1 || actualSeconds > 600) return;
+    const prev = getExpectedLegacySeconds();
+    const next = prev * 0.7 + actualSeconds * 0.3;
+    localStorage.setItem(LEGACY_UPLOAD_SECONDS_KEY, String(next));
+  }
+
+  function getLegacyEstimatedProgress(elapsedSeconds, expectedSeconds) {
+    const r = Math.max(0, elapsedSeconds / Math.max(1, expectedSeconds));
+    let percent = 15;
+    let stage = "extract_text";
+    let message = "Extracting text from your document...";
+
+    if (r < 0.12) {
+      percent = 15 + (r / 0.12) * 10; // 15 -> 25
+      stage = "doc_gate";
+      message = "Classifying document type...";
+    } else if (r < 0.48) {
+      percent = 25 + ((r - 0.12) / 0.36) * 35; // 25 -> 60
+      stage = "extraction";
+      message = "Extracting actionable repair items...";
+    } else if (r < 0.52) {
+      percent = 60 + ((r - 0.48) / 0.04) * 2; // 60 -> 62
+      stage = "stable_sort";
+      message = "Ordering repair items...";
+    } else if (r < 0.84) {
+      percent = 62 + ((r - 0.52) / 0.32) * 26; // 62 -> 88
+      stage = "pricing";
+      message = "Estimating repair pricing...";
+    } else if (r < 0.97) {
+      percent = 88 + ((r - 0.84) / 0.13) * 10; // 88 -> 98
+      stage = "providers";
+      message = "Finding top-rated local providers...";
+    } else {
+      // Keep moving gently past 98% to avoid a long visual stall.
+      const tail = Math.min(1.0, (r - 0.97) / 0.5);
+      percent = 98 + tail * 1.7; // 98 -> 99.7
+      stage = "finalizing";
+      message = "Finalizing your report...";
+    }
+
+    return {
+      percent: Math.max(15, Math.min(99.7, percent)),
+      stage,
+      message,
+    };
+  }
+
+  function buildFormData() {
+    const form = new FormData();
+    form.append("file", selectedFile);
+    form.append("address", lastAddress);
+    form.append("notes", lastNotes);
+    return form;
+  }
+
+  async function runLegacyUpload() {
+    console.log("DEBUG: Falling back to legacy /upload endpoint");
+    updateProgress(15, "Uploading document...", "Stage: upload");
+
+    const expectedSeconds = getExpectedLegacySeconds();
+    const startedAt = Date.now();
+    const ticker = setInterval(() => {
+      const elapsedSeconds = (Date.now() - startedAt) / 1000;
+      const est = getLegacyEstimatedProgress(elapsedSeconds, expectedSeconds);
+      updateProgress(est.percent, est.message, `Stage: ${est.stage}`);
+    }, 900);
+
+    let res;
+    try {
+      res = await fetch("/upload", { method: "POST", body: buildFormData() });
+    } catch (e) {
+      console.warn("DEBUG: Legacy /upload network error, retrying once...", e);
+      await sleep(350);
+      res = await fetch("/upload", { method: "POST", body: buildFormData() });
+    } finally {
+      clearInterval(ticker);
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || "Upload failed");
+    }
+
+    updateExpectedLegacySeconds((Date.now() - startedAt) / 1000);
+    updateProgress(100, "Report ready.", "Stage: complete");
+    return await res.json();
   }
 
   // Submit
@@ -187,22 +305,59 @@
     lastAddress = (addressInput?.value || "").trim();
 
     console.log("DEBUG: Submitting with address =", lastAddress);
-    const form = new FormData();
-    form.append("file", selectedFile);
-    form.append("address", lastAddress);
-    form.append("notes", lastNotes);
 
     try {
-      console.log("DEBUG: Making API call to /upload");
-      const res = await fetch("/upload", { method: "POST", body: form });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        console.error("DEBUG: /upload returned non-OK", res.status, err);
-        throw new Error(err.detail || "Upload failed");
+      console.log("DEBUG: Starting async upload job");
+      let data = null;
+      let startRes = null;
+      try {
+        startRes = await fetch("/upload/start", { method: "POST", body: buildFormData() });
+      } catch (e) {
+        console.warn("DEBUG: /upload/start network error, trying legacy /upload...", e);
+        data = await runLegacyUpload();
+        lastResult = data;
       }
+      if (!data && !startRes.ok && startRes.status === 404) {
+        data = await runLegacyUpload();
+        lastResult = data;
+      } else if (!data && !startRes.ok) {
+        const err = await startRes.json().catch(() => ({ detail: startRes.statusText }));
+        console.error("DEBUG: /upload/start returned non-OK", startRes.status, err);
+        throw new Error(err.detail || "Upload failed to start");
+      } else if (!data) {
+        const { job_id: jobId } = await startRes.json();
+        if (!jobId) throw new Error("Missing upload job ID");
 
-      const data = await res.json();
-      lastResult = data;
+        let jobStatus = null;
+        while (true) {
+          const statusRes = await fetch(`/upload/status/${encodeURIComponent(jobId)}`);
+          if (!statusRes.ok) {
+            const err = await statusRes.json().catch(() => ({ detail: statusRes.statusText }));
+            throw new Error(err.detail || "Status check failed");
+          }
+          jobStatus = await statusRes.json();
+          updateProgress(
+            jobStatus?.percent,
+            jobStatus?.message || "Inspectomatic is working tirelessly for you...",
+            jobStatus?.stage ? `Stage: ${jobStatus.stage}` : "Building your report…"
+          );
+          if (jobStatus?.done) break;
+          await sleep(600);
+        }
+
+        if (jobStatus?.status === "failed") {
+          throw new Error(jobStatus?.error || "Upload failed");
+        }
+
+        const resultRes = await fetch(`/upload/result/${encodeURIComponent(jobId)}`);
+        if (!resultRes.ok) {
+          const err = await resultRes.json().catch(() => ({ detail: resultRes.statusText }));
+          throw new Error(err.detail || "Result retrieval failed");
+        }
+
+        data = await resultRes.json();
+        lastResult = data;
+      }
 
       lastDocType = data?.meta?.doc_type || "";
       lastDocTypeLabel = data?.meta?.doc_type_label || "";
@@ -284,7 +439,7 @@
     if (!items.length) {
       console.warn("DEBUG: No items found to display in report");
       reportDisplay.innerHTML =
-        '<div style="text-align: center; padding: 40px; color: #6b7280;">No repair items found in the document.</div>';
+        '<div style="text-align: center; padding: 40px; color: var(--report-text-muted);">No repair items found in the document.</div>';
       loadingDisplay.style.display = "none";
       reportDisplay.classList.remove("hidden");
       return;
@@ -344,9 +499,9 @@
       (pricingTotals.low > 0 || pricingTotals.high > 0)
         ? `
         <div style="margin: 16px 0 24px; display: flex; justify-content: center;">
-          <div style="display: inline-flex; flex-direction: column; align-items: center; padding: 12px 20px; border-radius: 999px; border: 1px solid #000; background: #f9fafb; gap: 4px;">
-            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: #4b5563;">Estimated Total Repair Range</div>
-            <div style="font-size: 18px; font-weight: 600; color: #111827;">
+          <div style="display: inline-flex; flex-direction: column; align-items: center; padding: 12px 20px; border-radius: 999px; border: 1px solid var(--report-border-strong); background: var(--report-surface-soft); gap: 4px;">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--report-text-muted);">Estimated Total Repair Range</div>
+            <div style="font-size: 18px; font-weight: 600; color: var(--report-text);">
               ${formatMoney(pricingTotals.low, pricingTotals.currency)} – ${formatMoney(pricingTotals.high, pricingTotals.currency)}
             </div>
           </div>
@@ -364,19 +519,19 @@
         <div class="report-header">
           <div style="display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 16px;">
             <div style="display: flex; gap: 4px;">
-              <div style="width: 12px; height: 12px; border-radius: 50%; background: #000;"></div>
-              <div style="width: 12px; height: 12px; border-radius: 50%; background: #000; opacity: 0.3;"></div>
+              <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--report-accent);"></div>
+              <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--report-accent); opacity: 0.3;"></div>
             </div>
-            <h2 style="margin: 0; font-size: 24px; font-weight: normal; letter-spacing: 1px;">INSPECTOMATIC</h2>
+            <h2 style="margin: 0; font-size: 24px; font-weight: 600; letter-spacing: 0.06em; color: var(--report-text);">INSPECTOMATIC</h2>
           </div>
-          <p style="margin: 0; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">HOME BUYING RESOURCE TO SIMPLIFY</p>
-          <p style="margin: 0; font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px;">THE INSPECTION PROCESS</p>
-          <div style="margin: 20px 0 8px; height: 1px; background: #000; width: 120px; margin-left: auto; margin-right: auto;"></div>
-          <h3 style="margin: 0; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">PROPERTY REPORT</h3>
+          <p style="margin: 0; font-size: 11px; color: var(--report-text-muted); text-transform: uppercase; letter-spacing: 0.5px;">HOME BUYING RESOURCE TO SIMPLIFY</p>
+          <p style="margin: 0; font-size: 11px; color: var(--report-text-muted); text-transform: uppercase; letter-spacing: 0.5px;">THE INSPECTION PROCESS</p>
+          <div style="margin: 20px 0 8px; height: 1px; background: var(--report-border-strong); width: 120px; margin-left: auto; margin-right: auto;"></div>
+          <h3 style="margin: 0; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--report-text);">PROPERTY REPORT</h3>
         </div>
 
         <div style="text-align: center; margin-bottom: 8px;">
-          <p style="font-size: 16px; font-weight: 600; color: #000; margin: 0 0 8px 0;">${escapeHtml(
+          <p style="font-size: 16px; font-weight: 600; color: var(--report-text); margin: 0 0 8px 0;">${escapeHtml(
             address || "Property Address Not Specified"
           )}</p>
         </div>
@@ -398,9 +553,9 @@
 
     if (notes) {
       html += `
-        <div style="background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 16px; margin-bottom: 32px;">
-          <h4 style="margin: 0 0 8px 0; font-size: 12px; font-weight: 600; color: #000; text-transform: uppercase; letter-spacing: 0.5px;">ADDITIONAL NOTES</h4>
-          <p style="margin: 0; font-size: 14px; color: #666; line-height: 1.5;">${escapeHtml(notes)}</p>
+        <div style="background: var(--report-surface-soft); border: 1px solid var(--report-border); border-radius: 6px; padding: 16px; margin-bottom: 24px;">
+          <h4 style="margin: 0 0 8px 0; font-size: 12px; font-weight: 600; color: var(--report-text); text-transform: uppercase; letter-spacing: 0.5px;">ADDITIONAL NOTES</h4>
+          <p style="margin: 0; font-size: 14px; color: var(--report-text-muted); line-height: 1.5;">${escapeHtml(notes)}</p>
         </div>
       `;
     }
@@ -412,8 +567,8 @@
 
       html += `
         <div class="report-section" style="margin-bottom: 40px;">
-          <h3 style="background: #000; color: white; padding: 12px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; margin: 0 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(category)}</h3>
-          <div style="border: 1px solid #e9ecef; border-top: none; border-radius: 0 0 4px 4px; background: #fff;">
+          <h3 style="background: var(--report-accent); color: var(--report-on-accent); padding: 12px 16px; border-radius: 4px; font-weight: 600; font-size: 13px; margin: 0 0 1px 0; text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(category)}</h3>
+          <div style="border: 1px solid var(--report-border); border-top: none; border-radius: 0 0 4px 4px; background: var(--report-surface);">
       `;
 
       arr.forEach((item, index) => {
@@ -425,13 +580,13 @@
 
         // KEY: prevent page breaks inside each item block
         html += `
-          <div class="no-break" style="padding: 20px; border-bottom: 1px solid #f1f3f4; break-inside: avoid; page-break-inside: avoid;">
+          <div class="no-break" style="padding: 18px; border-bottom: 1px solid var(--report-accent-soft); break-inside: avoid; page-break-inside: avoid;">
             <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px;">
-              <div style="width: 24px; height: 24px; border: 1px solid #000; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+              <div style="width: 24px; height: 24px; border: 1px solid var(--report-border-strong); border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
                 <span style="font-size: 12px; font-weight: 600;">${index + 1}</span>
               </div>
               <div style="flex: 1;">
-                <h4 style="margin: 0 0 8px 0; font-size: 15px; font-weight: 600; color: #000;">${escapeHtml(item.item)}</h4>
+                <h4 style="margin: 0 0 8px 0; font-size: 15px; font-weight: 600; color: var(--report-text);">${escapeHtml(item.item)}</h4>
                 <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 8px;">
                   <span style="padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; ${getSeverityStyles(
                     item.severity
@@ -439,17 +594,17 @@
         `;
 
         if (item.location) {
-          html += `<span style="font-size: 12px; color: #666;">📍 ${escapeHtml(item.location)}</span>`;
+          html += `<span style="font-size: 12px; color: var(--report-text-muted);">📍 ${escapeHtml(item.location)}</span>`;
         }
 
         if (item.qty) {
-          html += `<span style="font-size: 12px; color: #666;">📦 Qty: ${item.qty}${
+          html += `<span style="font-size: 12px; color: var(--report-text-muted);">📦 Qty: ${item.qty}${
             item.units ? " " + escapeHtml(item.units) : ""
           }</span>`;
         }
 
         if (hasPrice) {
-          html += `<span style="font-size: 12px; color: #111827; font-weight: 600;">💰 ${formatMoney(
+          html += `<span style="font-size: 12px; color: var(--report-text); font-weight: 600;">💰 ${formatMoney(
             item.price_low,
             item.currency
           )} – ${formatMoney(item.price_high, item.currency)}</span>`;
@@ -463,9 +618,9 @@
               ? "Why this can be handled by a general handyman:"
               : `Why this requires a ${getSpecialistLabel(category)}:`;
           html += `
-            <div style="margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 4px; border-left: 3px solid #2563eb;">
-              <strong style="font-size: 13px; color: #000;">${escapeHtml(specialistLabel)}</strong>
-              <span style="font-size: 13px; color: #666; margin-left: 4px;">${escapeHtml(item.explanation)}</span>
+            <div style="margin-top: 10px; padding: 12px; background: var(--report-surface-soft); border-radius: 4px; border-left: 2px solid var(--report-border-strong);">
+              <strong style="font-size: 13px; color: var(--report-text);">${escapeHtml(specialistLabel)}</strong>
+              <span style="font-size: 13px; color: var(--report-text-muted); margin-left: 4px;">${escapeHtml(item.explanation)}</span>
             </div>
           `;
         }
@@ -479,15 +634,15 @@
 
       // Providers section should also avoid splitting
       html += `
-            <div class="no-break" style="padding: 20px; background: #f8f9fa; border-top: 1px solid #e9ecef; break-inside: avoid; page-break-inside: avoid;">
-              <h4 style="margin: 0 0 12px 0; font-size: 12px; font-weight: 600; color: #000; text-transform: uppercase; letter-spacing: 0.5px;">RECOMMENDED PROVIDERS</h4>
+            <div class="no-break" style="padding: 18px; background: var(--report-surface-soft); border-top: 1px solid var(--report-border); break-inside: avoid; page-break-inside: avoid;">
+              <h4 style="margin: 0 0 12px 0; font-size: 12px; font-weight: 700; color: var(--report-text); text-transform: uppercase; letter-spacing: 0.5px;">RECOMMENDED PROVIDERS</h4>
               <div style="display: flex; flex-direction: column; gap: 8px;">
       `;
 
       if (providers.length) {
         providers.slice(0, 3).forEach((p, idx) => {
           html += `
-            <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #111827;">
+            <div style="padding: 8px 12px; background: var(--report-surface); border: 1px dashed var(--report-border-strong); border-radius: 4px; font-size: 12px; color: var(--report-text);">
               <strong>${idx + 1}) ${escapeHtml(p.name || "Unknown")}</strong><br>
               ${p.phone ? `📞 ${escapeHtml(p.phone)} ` : ""}
               ${
@@ -497,7 +652,7 @@
               }
               ${
                 p.address
-                  ? `<br><span style="color:#6b7280;">📍 ${escapeHtml(p.address)}</span>`
+                  ? `<br><span style="color: var(--report-text-muted);">📍 ${escapeHtml(p.address)}</span>`
                   : ""
               }
             </div>
@@ -507,7 +662,7 @@
 
       for (let i = providers.length + 1; i <= 3; i++) {
         html += `
-          <div style="padding: 8px 12px; background: #fff; border: 1px dashed #ccc; border-radius: 4px; font-size: 12px; color: #666;">
+          <div style="padding: 8px 12px; background: var(--report-surface); border: 1px dashed var(--report-border-strong); border-radius: 4px; font-size: 12px; color: var(--report-text-muted);">
             ${i}) Company: ___________________   Phone: ___________________   Rating: ___________________
           </div>
         `;
@@ -522,12 +677,12 @@
     });
 
     html += `
-        <div class="no-break" style="text-align: center; padding: 20px; background: #000; color: white; border-radius: 4px; margin-top: 32px; break-inside: avoid; page-break-inside: avoid;">
+        <div class="no-break" style="text-align: center; padding: 20px; background: var(--report-accent); color: var(--report-on-accent); border-radius: 4px; margin-top: 24px; break-inside: avoid; page-break-inside: avoid;">
           <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${totalItems}</div>
           <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">${
             totalItems === 1 ? "REPAIR ITEM IDENTIFIED" : "REPAIR ITEMS IDENTIFIED"
           }</div>
-          <div style="font-size: 10px; color: #ccc; margin-top: 8px; font-style: italic;">Generated by Inspectomatic</div>
+          <div style="font-size: 10px; color: var(--report-summary-muted); margin-top: 8px; font-style: italic;">Generated by Inspectomatic</div>
         </div>
       </div>
     `;
@@ -537,11 +692,11 @@
 
   function getSeverityStyles(severity) {
     const styles = {
-      high: "background: #fee2e2; color: #dc2626;",
-      medium: "background: #fef3c7; color: #d97706;",
-      low: "background: #d1fae5; color: #059669;"
+      high: "background: var(--sev-high-bg); color: var(--sev-high-text);",
+      medium: "background: var(--sev-medium-bg); color: var(--sev-medium-text);",
+      low: "background: var(--sev-low-bg); color: var(--sev-low-text);"
     };
-    return styles[String(severity || "").toLowerCase()] || "background: #f3f4f6; color: #374151;";
+    return styles[String(severity || "").toLowerCase()] || "background: var(--report-surface-soft); color: var(--report-text-muted);";
   }
 
   function formatMoney(value, currency) {

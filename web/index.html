@@ -18,7 +18,7 @@
   <div class="wrap">
     <div class="card">
       <h1>Inspectomatic</h1>
-      <p class="meta" style="margin-top: -8px; margin-bottom: 24px;">Transform inspection reports into organized, actionable repair lists</p>
+      <p class="meta subtitle-text">Transform repair proposals and inspection reports into clear, actionable repair lists and connect with top-rated providers in your community.</p>
       
       <ol class="steps">
         <li class="step active" data-step="1"><span>1</span> Upload inspection report</li>
@@ -39,7 +39,7 @@
             </div>
           </div>
           <input id="fileInput" type="file" accept=".pdf,.txt,.png,.jpg,.jpeg" class="hidden"/>
-          <div id="fileBadge" class="row meta" style="margin-top:12px;"></div>
+          <div id="fileBadge" class="row meta file-badge"></div>
           <div class="row nav">
             <button id="nextFrom1" class="btn" disabled>Next</button>
           </div>
@@ -70,27 +70,28 @@
 
         <!-- Step 4: Submit + Results -->
         <section class="pane hidden" id="pane-4">
-          <div class="meta">
-            Our AI system will analyze your inspection report and organize it into actionable repair categories with contractor recommendations.
-          </div>
           <div class="row nav">
             <button id="backTo3" class="btn secondary">Back</button>
             <button id="submitBtn" class="btn">Analyze Report</button>
           </div>
 
           <div class="divider"></div>
-          <div class="row" style="margin-bottom:8px;">
+          <div class="row analysis-row">
             <div class="headline">Inspection Report Analysis</div>
-            <button id="downloadPdfBtn" class="btn" style="margin-left:auto;" disabled>Download PDF Report</button>
+            <button id="downloadPdfBtn" class="btn download-pdf-btn" disabled>Download PDF Report</button>
           </div>
 
           <div class="result">
             <div id="reportDisplay" class="hidden">
               <!-- Beautiful report will be rendered here -->
             </div>
-            <div id="loadingDisplay" style="text-align: center; padding: 60px 20px; color: #6b7280;">
-              <div id="loadingText">Awaiting analysis...</div>
-              <div id="status" class="meta" style="margin-top: 8px;"></div>
+            <div id="loadingDisplay" class="loading-display">
+              <div id="loadingText">Inspectomatic is working tirelessly for you...</div>
+              <div id="status" class="meta status-text"></div>
+              <div class="progress-wrap">
+                <div id="progressBar" class="progress-bar-fill" style="width: 0%;"></div>
+              </div>
+              <div id="progressPercent" class="meta progress-percent">0%</div>
             </div>
           </div>
         </section>

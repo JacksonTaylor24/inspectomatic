@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any, Callable, Awaitable
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -17,6 +17,10 @@ import pytesseract
 import io, re, os, json
 from pathlib import Path
 import requests
+import asyncio
+import time
+import httpx
+from uuid import uuid4
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 print("DEBUG[config]: GOOGLE_MAPS_API_KEY present:", bool(GOOGLE_MAPS_API_KEY))
@@ -27,10 +31,18 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "200000"))
 CLAUDE_RESPONSE_MAX_TOKENS = int(os.getenv("CLAUDE_RESPONSE_MAX_TOKENS", "8192"))
+PRICING_CONCURRENCY = max(1, int(os.getenv("PRICING_CONCURRENCY", "3")))
+PROVIDER_CONCURRENCY = max(1, int(os.getenv("PROVIDER_CONCURRENCY", "3")))
+GOOGLE_HTTP_TIMEOUT = float(os.getenv("GOOGLE_HTTP_TIMEOUT", "5"))
+UPLOAD_JOB_TTL_SECONDS = int(os.getenv("UPLOAD_JOB_TTL_SECONDS", "3600"))
 
 print("DEBUG[config]: CLAUDE_MODEL =", CLAUDE_MODEL)
 print("DEBUG[config]: ANTHROPIC_API_KEY present:", bool(ANTHROPIC_API_KEY))
 print("DEBUG[config]: CLAUDE_MAX_TOKENS =", CLAUDE_MAX_TOKENS, "CLAUDE_RESPONSE_MAX_TOKENS =", CLAUDE_RESPONSE_MAX_TOKENS)
+print("DEBUG[config]: PRICING_CONCURRENCY =", PRICING_CONCURRENCY, "PROVIDER_CONCURRENCY =", PROVIDER_CONCURRENCY)
+
+_upload_jobs: Dict[str, Dict[str, Any]] = {}
+_upload_jobs_lock = asyncio.Lock()
 
 _anthropic_client = None
 try:
@@ -191,6 +203,18 @@ class ParsedResponse(BaseModel):
     ignored_examples: Optional[List[IgnoredExample]] = None
     meta: Optional[Dict] = None
 
+class UploadStartResponse(BaseModel):
+    job_id: str
+
+class UploadStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    percent: float
+    stage: str
+    message: str
+    done: bool
+    error: Optional[str] = None
+
 # ---------------- Helpers ----------------
 def _coerce_json(text: str):
     if not text:
@@ -223,6 +247,36 @@ def _num(x) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+
+def _elapsed_s(start: float) -> float:
+    return round(time.perf_counter() - start, 3)
+
+def _print_upload_timing_summary(timings: Dict[str, float]) -> None:
+    print(
+        "TIMING[/upload]:\n"
+        f"  extract_text={timings.get('extract_text', 0.0):.3f}s\n"
+        f"  doc_gate={timings.get('doc_gate', 0.0):.3f}s\n"
+        f"  extraction={timings.get('extraction', 0.0):.3f}s\n"
+        f"  stable_sort={timings.get('stable_sort', 0.0):.3f}s\n"
+        f"  pricing={timings.get('pricing', 0.0):.3f}s\n"
+        f"  providers={timings.get('providers', 0.0):.3f}s\n"
+        f"  total={timings.get('total', 0.0):.3f}s"
+    )
+
+async def _set_job_state(job_id: str, **updates: Any) -> None:
+    async with _upload_jobs_lock:
+        job = _upload_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+
+async def _cleanup_old_jobs() -> None:
+    now = time.time()
+    async with _upload_jobs_lock:
+        stale = [jid for jid, job in _upload_jobs.items() if now - float(job.get("updated_at", now)) > UPLOAD_JOB_TTL_SECONDS]
+        for jid in stale:
+            _upload_jobs.pop(jid, None)
 
 def chunk_text_by_tokens(text: str, max_tokens: int) -> List[str]:
     max_chars = max_tokens * 4
@@ -702,6 +756,98 @@ def call_claude_pricing(
     print("DEBUG[call_claude_pricing]: built pricing map for", len(out), "of", total, "items")
     return out
 
+async def call_claude_pricing_async(
+    items: List["NormalizedLineItem"],
+    address: str = "",
+    batch_size: int = 15,
+    max_passes: int = 2,
+    concurrency: int = PRICING_CONCURRENCY,
+) -> Dict[int, PriceEstimate]:
+    if not ANTHROPIC_API_KEY or not _anthropic_client:
+        print("DEBUG[call_claude_pricing_async]: Anthropic not configured")
+        return {}
+
+    total = len(items)
+    out: Dict[int, PriceEstimate] = {}
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    def build_payload(indexes: List[int]) -> List[dict]:
+        payload = []
+        for idx in indexes:
+            it = items[idx]
+            payload.append({
+                "index": idx,
+                "category": it.category,
+                "item": it.item,
+                "location": it.location,
+                "severity": it.severity,
+                "qty": it.qty,
+                "units": it.units,
+            })
+        return payload
+
+    def ingest(parsed: dict):
+        if not isinstance(parsed, dict):
+            return
+        arr = parsed.get("items", [])
+        if not isinstance(arr, list):
+            return
+        for obj in arr:
+            if not isinstance(obj, dict):
+                continue
+            try:
+                idx = int(obj.get("index"))
+            except Exception:
+                continue
+            low = _num(obj.get("price_low"))
+            high = _num(obj.get("price_high"))
+            if low is None or high is None:
+                continue
+            try:
+                out[idx] = PriceEstimate(
+                    low=float(low),
+                    high=float(high),
+                    currency=(obj.get("currency") or "USD"),
+                    basis=(obj.get("basis") or "per job"),
+                    confidence=(obj.get("confidence") or "medium"),
+                    notes=obj.get("notes"),
+                )
+            except Exception:
+                continue
+
+    async def run_batch(batch_idxs: List[int], phase: str):
+        payload = build_payload(batch_idxs)
+        try:
+            async with sem:
+                return await asyncio.to_thread(_call_claude_pricing_batch, payload, address)
+        except Exception as e:
+            print(f"DEBUG[call_claude_pricing_async]: {phase} batch exception:", e)
+            return None
+
+    all_indexes = list(range(total))
+
+    # pass 1
+    initial_batches = [all_indexes[start:start + batch_size] for start in range(0, total, batch_size)]
+    initial_results = await asyncio.gather(*(run_batch(batch, "pass1") for batch in initial_batches))
+    for parsed in initial_results:
+        if parsed:
+            ingest(parsed)
+
+    # retries
+    for pass_i in range(1, max_passes + 1):
+        missing = [i for i in all_indexes if i not in out]
+        if not missing:
+            break
+        print(f"DEBUG[call_claude_pricing_async]: pass {pass_i} retrying missing={len(missing)}")
+        retry_batches = [missing[start:start + batch_size] for start in range(0, len(missing), batch_size)]
+        retry_results = await asyncio.gather(*(run_batch(batch, f"retry{pass_i}") for batch in retry_batches))
+        for parsed in retry_results:
+            if parsed:
+                ingest(parsed)
+
+    print("DEBUG[call_claude_pricing_async]: built pricing map for", len(out), "of", total, "items")
+    return out
+
 # ---------------- Header/numbering filters + fallback ----------------
 NUMBERED_OR_BULLET = re.compile(r"^\s*(?:\d+(?:\.\d+)*\s*[\.)-]?\s*|[-*•]\s+)?(.+)$", re.MULTILINE)
 SECTION_HEADER_PATTERN = re.compile(r"^\s*\d+(?:\.\d+)+\s+[A-Za-z].{0,80}:\s+.+$")
@@ -927,7 +1073,7 @@ def geocode_address(address: str):
         resp = requests.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
             params={"address": address, "key": GOOGLE_MAPS_API_KEY},
-            timeout=5,
+            timeout=GOOGLE_HTTP_TIMEOUT,
         )
         data = resp.json()
         if data.get("status") != "OK":
@@ -944,7 +1090,7 @@ def _places_nearby(lat: float, lng: float, keyword: str, radius_m: int) -> list:
         resp = requests.get(
             "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
             params={"key": GOOGLE_MAPS_API_KEY, "location": f"{lat},{lng}", "radius": radius_m, "keyword": keyword},
-            timeout=5,
+            timeout=GOOGLE_HTTP_TIMEOUT,
         )
         data = resp.json()
         return data.get("results", []) or []
@@ -958,7 +1104,7 @@ def _place_details(place_id: str) -> dict:
         resp = requests.get(
             "https://maps.googleapis.com/maps/api/place/details/json",
             params={"key": GOOGLE_MAPS_API_KEY, "place_id": place_id, "fields": "formatted_phone_number,website,formatted_address"},
-            timeout=5,
+            timeout=GOOGLE_HTTP_TIMEOUT,
         )
         data = resp.json()
         return data.get("result", {}) or {}
@@ -1008,39 +1154,155 @@ def find_providers_for_category(category: str, lat: float, lng: float) -> list:
         enriched.append(p)
     return enriched
 
+async def geocode_address_async(client: httpx.AsyncClient, address: str):
+    if not GOOGLE_MAPS_API_KEY or not address:
+        return None
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        loc = data["results"][0]["geometry"]["location"]
+        return (loc["lat"], loc["lng"])
+    except Exception:
+        return None
+
+async def _places_nearby_async(client: httpx.AsyncClient, lat: float, lng: float, keyword: str, radius_m: int) -> list:
+    if not GOOGLE_MAPS_API_KEY:
+        return []
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params={"key": GOOGLE_MAPS_API_KEY, "location": f"{lat},{lng}", "radius": radius_m, "keyword": keyword},
+        )
+        data = resp.json()
+        return data.get("results", []) or []
+    except Exception:
+        return []
+
+async def _place_details_async(client: httpx.AsyncClient, place_id: str) -> dict:
+    if not GOOGLE_MAPS_API_KEY or not place_id:
+        return {}
+    try:
+        resp = await client.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={"key": GOOGLE_MAPS_API_KEY, "place_id": place_id, "fields": "formatted_phone_number,website,formatted_address"},
+        )
+        data = resp.json()
+        return data.get("result", {}) or {}
+    except Exception:
+        return {}
+
+async def find_providers_for_category_async(
+    category: str,
+    lat: float,
+    lng: float,
+    client: httpx.AsyncClient,
+    details_concurrency: int = PROVIDER_CONCURRENCY,
+) -> list:
+    labels = CATEGORY_PROVIDER_MAP.get(category, {}).get("providers") or [category]
+    keyword = " ".join(labels)
+    radii_miles = [10, 20, 40]
+    radii = [int(r * 1609.34) for r in radii_miles]
+    seen = set()
+    candidates = []
+
+    for r_m in radii:
+        results = await _places_nearby_async(client, lat, lng, keyword, r_m)
+        for r in results:
+            pid = r.get("place_id")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            rating = float(r.get("rating", 0.0))
+            reviews = int(r.get("user_ratings_total", 0))
+            if rating < 4.0 or reviews < 5:
+                continue
+            score = provider_score(rating, reviews)
+            candidates.append({
+                "place_id": pid,
+                "name": r.get("name"),
+                "rating": rating,
+                "review_count": reviews,
+                "address": r.get("vicinity"),
+                "score": score,
+            })
+        if len(candidates) >= 15:
+            break
+
+    candidates.sort(key=lambda x: (x["score"], x["review_count"]), reverse=True)
+    top = candidates[:3]
+    detail_sem = asyncio.Semaphore(max(1, details_concurrency))
+
+    async def enrich_provider(p: dict) -> dict:
+        provider = dict(p)
+        try:
+            async with detail_sem:
+                details = await _place_details_async(client, provider["place_id"])
+            if details:
+                provider["phone"] = details.get("formatted_phone_number")
+                provider["website"] = details.get("website")
+                provider["address"] = details.get("formatted_address") or provider.get("address")
+        except Exception:
+            pass
+        return provider
+
+    enriched = await asyncio.gather(*(enrich_provider(p) for p in top))
+    return list(enriched)
+
 # ---------------- Routes ----------------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.post("/upload", response_model=ParsedResponse)
-async def upload(
-    file: UploadFile = File(...),
-    address: str = Form(default=""),
-    notes: str = Form(default=""),
-):
-    print("\n=== DEBUG[/upload]: new request ===")
-    print("DEBUG[/upload]: incoming filename:", file.filename)
+async def _run_upload_pipeline(
+    data: bytes,
+    name: str,
+    address: str = "",
+    notes: str = "",
+    progress_cb: Optional[Callable[[float, str, str], Awaitable[None]]] = None,
+) -> ParsedResponse:
+    async def emit_progress(percent: float, stage: str, message: str) -> None:
+        if progress_cb:
+            await progress_cb(percent, stage, message)
 
-    data = await file.read()
-    name = (file.filename or "").lower()
+    req_start = time.perf_counter()
+    timings: Dict[str, float] = {
+        "extract_text": 0.0,
+        "doc_gate": 0.0,
+        "extraction": 0.0,
+        "stable_sort": 0.0,
+        "pricing": 0.0,
+        "providers": 0.0,
+        "total": 0.0,
+    }
+
+    print("\n=== DEBUG[/upload]: new request ===")
+    print("DEBUG[/upload]: incoming filename:", name)
 
     text = ""
     first_pages_text = ""
     num_pages = 1
 
+    await emit_progress(2.0, "extract_text", "Reading and extracting text from your document...")
+    extract_text_start = time.perf_counter()
     if name.endswith(".pdf"):
-        text, num_pages, first_pages_text = extract_pages_text_from_pdf(data)
+        text, num_pages, first_pages_text = await asyncio.to_thread(extract_pages_text_from_pdf, data)
     elif name.endswith(".txt"):
         text = data.decode("utf-8", errors="ignore")
         first_pages_text = text[:6000]
         num_pages = 1
     elif name.endswith((".png", ".jpg", ".jpeg")):
-        text = extract_text_from_image(data)
+        text = await asyncio.to_thread(extract_text_from_image, data)
         first_pages_text = text[:6000]
         num_pages = 1
     else:
         raise HTTPException(status_code=400, detail="Supported: .pdf, .txt, .png, .jpg, .jpeg")
+    timings["extract_text"] = _elapsed_s(extract_text_start)
+    await emit_progress(15.0, "extract_text", "Text extraction complete.")
 
     if not text or len(text.strip()) < 20:
         raise HTTPException(status_code=422, detail="No meaningful text could be extracted from the file.")
@@ -1048,8 +1310,17 @@ async def upload(
     print("DEBUG[/upload]: extracted chars:", len(text), "pages:", num_pages)
 
     # --- OPEN-SET LLM GATE ---
+    await emit_progress(18.0, "doc_gate", "Classifying document type...")
     snippets = _sample_snippets(text, n=3, snippet_chars=900)
-    gate = classify_document_llm(page_count=num_pages, first_pages_text=first_pages_text, snippets=snippets)
+    doc_gate_start = time.perf_counter()
+    gate = await asyncio.to_thread(
+        classify_document_llm,
+        page_count=num_pages,
+        first_pages_text=first_pages_text,
+        snippets=snippets,
+    )
+    timings["doc_gate"] = _elapsed_s(doc_gate_start)
+    await emit_progress(25.0, "doc_gate", "Document classification complete.")
 
     doc_type = gate.get("doc_type", "unknown")
     doc_label = gate.get("doc_label", "Unknown")
@@ -1075,27 +1346,43 @@ async def upload(
         "pricing_items_priced": 0,
         "pricing_totals": {"low": 0.0, "high": 0.0, "currency": "USD"},
         "providers": {},
+        "timings": dict(timings),
     }
 
     # Refuse if out-of-domain or too-uncertain
     if (not in_domain) or (doc_type == "unknown" and doc_conf == "low"):
         meta["user_message"] = "Unable to complete analysis. This document does not appear to be an inspection report or repair proposal. Did you upload the right document?"
+        timings["total"] = _elapsed_s(req_start)
+        meta["timings"] = dict(timings)
+        _print_upload_timing_summary(timings)
+        await emit_progress(100.0, "complete", "Analysis complete.")
         return ParsedResponse(address=address or None, notes=notes or None, items=[], normalized_items=[], ignored_examples=[], meta=meta)
 
     if doc_type == "unknown":
         meta["user_message"] = "Unable to confidently determine document type. Please upload the inspection report or repair proposal."
+        timings["total"] = _elapsed_s(req_start)
+        meta["timings"] = dict(timings)
+        _print_upload_timing_summary(timings)
+        await emit_progress(100.0, "complete", "Analysis complete.")
         return ParsedResponse(address=address or None, notes=notes or None, items=[], normalized_items=[], ignored_examples=[], meta=meta)
 
     # --- Extraction ---
+    await emit_progress(30.0, "extraction", "Extracting actionable repair items...")
     normalized_items: List[NormalizedLineItem] = []
     ignored_examples: List[IgnoredExample] = []
     items_for_display: List[LineItem] = []
+    extraction_start = time.perf_counter()
 
     if ANTHROPIC_API_KEY and _anthropic_client:
         meta["llm_used"] = True
         meta["extraction_method"] = f"claude_comprehensive_{doc_type}"
         try:
-            normalized_items, ignored_examples, extraction_meta = extract_repairs_comprehensive(text, address, doc_type=doc_type)
+            normalized_items, ignored_examples, extraction_meta = await asyncio.to_thread(
+                extract_repairs_comprehensive,
+                text,
+                address,
+                doc_type,
+            )
             meta.update(extraction_meta)
         except Exception as e:
             meta["llm_error"] = str(e)
@@ -1115,19 +1402,34 @@ async def upload(
     normalized_items = dedupe_and_arbitrate(normalized_items)
     normalized_items = ensure_explanations(normalized_items)
 
+    timings["extraction"] = _elapsed_s(extraction_start)
+    await emit_progress(60.0, "extraction", "Repair extraction complete.")
+
     # ✅ NEW: stable sort before pricing (this is what you asked for)
+    await emit_progress(61.0, "stable_sort", "Ordering repair items...")
+    stable_sort_start = time.perf_counter()
     normalized_items = sort_items_stably(normalized_items)
     meta["stable_sort_before_pricing"] = True
+    timings["stable_sort"] = _elapsed_s(stable_sort_start)
+    await emit_progress(62.0, "stable_sort", "Item ordering complete.")
 
     # --- Pricing (coverage-guaranteed) ---
     meta["pricing_attempted"] = False
     meta["pricing_items_in"] = len(normalized_items)
     meta["pricing_items_priced"] = 0
+    await emit_progress(66.0, "pricing", "Estimating repair pricing...")
+    pricing_start = time.perf_counter()
 
     if normalized_items and ANTHROPIC_API_KEY and _anthropic_client:
         meta["pricing_attempted"] = True
         try:
-            pricing_map = call_claude_pricing(normalized_items, address, batch_size=15, max_passes=2)
+            pricing_map = await call_claude_pricing_async(
+                normalized_items,
+                address,
+                batch_size=15,
+                max_passes=2,
+                concurrency=PRICING_CONCURRENCY,
+            )
 
             priced_count = 0
             for idx, it in enumerate(normalized_items):
@@ -1155,20 +1457,46 @@ async def upload(
             meta["pricing_used"] = (totals["low"] > 0 or totals["high"] > 0)
         except Exception as e:
             meta["pricing_error"] = str(e)
+    timings["pricing"] = _elapsed_s(pricing_start)
+    await emit_progress(88.0, "pricing", "Pricing complete.")
 
     # --- Provider search ---
+    await emit_progress(90.0, "providers", "Finding top-rated local providers...")
     providers_by_category: Dict[str, List[Dict]] = {}
+    providers_start = time.perf_counter()
     if GOOGLE_MAPS_API_KEY and address and normalized_items:
-        coords = geocode_address(address)
-        if coords:
-            lat, lng = coords
-            used_categories = sorted({it.category for it in normalized_items})
-            for cat in used_categories:
-                try:
-                    providers_by_category[cat] = find_providers_for_category(cat, lat, lng)
-                except Exception as e:
-                    print(f"DEBUG[/upload]: Provider search error for {cat}: {e}")
+        try:
+            timeout = httpx.Timeout(GOOGLE_HTTP_TIMEOUT)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                coords = await geocode_address_async(client, address)
+                if coords:
+                    lat, lng = coords
+                    used_categories = sorted({it.category for it in normalized_items})
+                    cat_sem = asyncio.Semaphore(max(1, PROVIDER_CONCURRENCY))
+
+                    async def fetch_category_providers(cat: str):
+                        try:
+                            async with cat_sem:
+                                providers = await find_providers_for_category_async(
+                                    cat,
+                                    lat,
+                                    lng,
+                                    client,
+                                    details_concurrency=PROVIDER_CONCURRENCY,
+                                )
+                            return cat, providers
+                        except Exception as e:
+                            print(f"DEBUG[/upload]: Provider search error for {cat}: {e}")
+                            return cat, []
+
+                    pairs = await asyncio.gather(*(fetch_category_providers(cat) for cat in used_categories))
+                    for cat, providers in pairs:
+                        providers_by_category[cat] = providers
+        except Exception as e:
+            print("DEBUG[/upload]: Provider search setup error:", e)
     meta["providers"] = providers_by_category
+    timings["providers"] = _elapsed_s(providers_start)
+    await emit_progress(98.0, "providers", "Provider matching complete.")
 
     # --- Build display items ---
     for it in normalized_items:
@@ -1200,6 +1528,10 @@ async def upload(
             currency=it.price.currency if it.price else None,
         ))
 
+    timings["total"] = _elapsed_s(req_start)
+    meta["timings"] = dict(timings)
+    _print_upload_timing_summary(timings)
+    await emit_progress(100.0, "complete", "Report ready.")
     return ParsedResponse(
         address=address or None,
         notes=notes or None,
@@ -1209,6 +1541,132 @@ async def upload(
         meta=meta,
     )
 
+async def _process_upload_job(
+    job_id: str,
+    data: bytes,
+    name: str,
+    address: str,
+    notes: str,
+) -> None:
+    async def progress(percent: float, stage: str, message: str) -> None:
+        await _set_job_state(
+            job_id,
+            percent=max(0.0, min(100.0, float(percent))),
+            stage=stage,
+            message=message,
+            status="running",
+            done=False,
+        )
+
+    try:
+        await progress(1.0, "queued", "Upload queued.")
+        result = await _run_upload_pipeline(
+            data=data,
+            name=name,
+            address=address,
+            notes=notes,
+            progress_cb=progress,
+        )
+        await _set_job_state(
+            job_id,
+            status="completed",
+            percent=100.0,
+            stage="complete",
+            message="Report ready.",
+            done=True,
+            result=result.model_dump(),
+            error=None,
+        )
+    except HTTPException as e:
+        await _set_job_state(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="Upload failed.",
+            done=True,
+            error=str(e.detail),
+        )
+    except Exception as e:
+        await _set_job_state(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="Upload failed.",
+            done=True,
+            error=str(e),
+        )
+
+@app.post("/upload/start", response_model=UploadStartResponse)
+async def upload_start(
+    file: UploadFile = File(...),
+    address: str = Form(default=""),
+    notes: str = Form(default=""),
+):
+    data = await file.read()
+    name = (file.filename or "").lower()
+    job_id = uuid4().hex
+    now = time.time()
+
+    async with _upload_jobs_lock:
+        _upload_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "percent": 0.0,
+            "stage": "queued",
+            "message": "Upload queued.",
+            "done": False,
+            "error": None,
+            "result": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    asyncio.create_task(_process_upload_job(job_id, data, name, address, notes))
+    await _cleanup_old_jobs()
+    return UploadStartResponse(job_id=job_id)
+
+@app.get("/upload/status/{job_id}", response_model=UploadStatusResponse)
+async def upload_status(job_id: str):
+    await _cleanup_old_jobs()
+    async with _upload_jobs_lock:
+        job = _upload_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return UploadStatusResponse(
+            job_id=job_id,
+            status=str(job.get("status", "queued")),
+            percent=float(job.get("percent", 0.0)),
+            stage=str(job.get("stage", "queued")),
+            message=str(job.get("message", "")),
+            done=bool(job.get("done", False)),
+            error=job.get("error"),
+        )
+
+@app.get("/upload/result/{job_id}", response_model=ParsedResponse)
+async def upload_result(job_id: str):
+    await _cleanup_old_jobs()
+    async with _upload_jobs_lock:
+        job = _upload_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        status = str(job.get("status", "queued"))
+        if status == "failed":
+            raise HTTPException(status_code=500, detail=str(job.get("error") or "Upload failed"))
+        if status != "completed":
+            raise HTTPException(status_code=409, detail="Result not ready")
+        result = job.get("result")
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="Invalid job result")
+    return ParsedResponse(**result)
+
+@app.post("/upload", response_model=ParsedResponse)
+async def upload(
+    file: UploadFile = File(...),
+    address: str = Form(default=""),
+    notes: str = Form(default=""),
+):
+    data = await file.read()
+    name = (file.filename or "").lower()
+    return await _run_upload_pipeline(data=data, name=name, address=address, notes=notes)
+
 # Run: uvicorn app:app --reload
-
-
